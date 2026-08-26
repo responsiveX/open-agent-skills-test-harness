@@ -6243,13 +6243,98 @@ def _check_inline_truncation(failures, verbose):
                and "x" * 11 not in out_trunc,
                f"oversize file inlined up to the cap with a note: {out_trunc!r}",
                failures, verbose)
+        # Without truncate the CONTENTS are still withheld — but the file must be NAMED as
+        # withheld. Returning a bare "" made a dropped file indistinguishable from a file the
+        # run never produced, which is how a toolless judge failed rubric items for code that
+        # was sitting in workspace/.
         out_skip = inline_files(ws, max_bytes=10)
-        _check("inline.judge_still_skips", out_skip == "",
-               f"without truncate, an oversize file is skipped entirely: {out_skip!r}",
+        _check("inline.oversize_contents_withheld",
+               "x" * 11 not in out_skip,
+               f"without truncate, an oversize file's contents stay out: {out_skip!r}",
+               failures, verbose)
+        _check("inline.oversize_skip_announced",
+               "NOT INLINED" in out_skip and "big.csv" in out_skip,
+               f"a skipped oversize file is named, not silently dropped: {out_skip!r}",
                failures, verbose)
         out_full = inline_files(ws)
         _check("inline.uncapped_full", "x" * 100 in out_full,
                "no cap inlines the whole file", failures, verbose)
+        _check("inline.uncapped_no_marker", "NOT INLINED" not in out_full,
+               "an uncapped (report) view drops nothing, so it emits no marker",
+               failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_inline_text_kinds(failures, verbose):
+    """inline_files must recognize the source files the evals actually produce. The contents
+    it returns are the ONLY evidence the judge has (it grades with tools disabled), so an
+    extension missing from the allowlist is not cosmetic: the file degrades to a bare name in
+    the tree and the judge fails every rubric item that depends on reading it.
+
+    Regression: _TEXT_EXT held no .NET extension at all, so every .cs/.csproj/.slnx workspace
+    inlined as the empty string and whole eval suites scored 0 with the judge reporting it
+    could not see the code. .editorconfig covers the second half of that bug — splitext() on a
+    dotfile yields no extension, so no _TEXT_EXT entry can ever match one."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files
+
+    print("inline text kinds:")
+    ws = tempfile.mkdtemp(prefix="ase-kinds-")
+    try:
+        os.makedirs(os.path.join(ws, "src"))
+        written = {
+            os.path.join("src", "Payment.cs"): "public sealed class Payment { }",
+            os.path.join("src", "App.csproj"): "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+            "Contoso.slnx": "<Solution />",
+            "Directory.Build.props": "<Project><PropertyGroup /></Project>",
+            ".editorconfig": "[*.cs]\ndotnet_diagnostic.CA1707.severity = error",
+        }
+        for rel, body in written.items():
+            with open(os.path.join(ws, rel), "w") as fh:
+                fh.write(body)
+        with open(os.path.join(ws, "logo.png"), "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n")
+
+        out = inline_files(ws)
+        for rel, body in written.items():
+            _check(f"inline.kind{os.path.splitext(rel)[1] or '_dotfile'}"
+                   f".{os.path.basename(rel)}",
+                   body in out,
+                   f"{rel} contents reach the judge", failures, verbose)
+        _check("inline.binary_still_excluded", "PNG" not in out,
+               "a real binary is still not inlined", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_inline_file_cap_announced(failures, verbose):
+    """Hitting the file-count cap must be announced. file_tree already prints a truncation
+    line; inline_files stopped silently, so a partially-graded case looked byte-identical to a
+    fully-graded one and the judge had no way to know evidence was missing."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files
+
+    print("inline file-cap marker:")
+    ws = tempfile.mkdtemp(prefix="ase-cap-")
+    try:
+        for i in range(7):
+            with open(os.path.join(ws, f"F{i}.cs"), "w") as fh:
+                fh.write(f"class F{i} {{ }}")
+        out = inline_files(ws, max_files=5)
+        _check("inline.cap_inlines_budget", out.count("--- F") == 5,
+               f"exactly max_files files inlined: {out.count('--- F')}", failures, verbose)
+        _check("inline.cap_announced",
+               "NOT INLINED" in out and "F5.cs" in out and "F6.cs" in out,
+               f"the two files over the cap are named: {out[-300:]!r}", failures, verbose)
+        _check("inline.cap_counts_only_inlinable", "2 more text file(s)" in out,
+               f"the count reflects withheld TEXT files: {out[-300:]!r}", failures, verbose)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
 
@@ -9203,6 +9288,8 @@ def _run_selftest_checks(verbose: bool = False) -> int:
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _section(_check_inline_truncation, failures, verbose)
+    _section(_check_inline_text_kinds, failures, verbose)
+    _section(_check_inline_file_cap_announced, failures, verbose)
 
     # model-rejection annotation only fires on actual rejections
     _section(_check_model_error_heuristic, failures, verbose)

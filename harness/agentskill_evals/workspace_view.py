@@ -17,15 +17,51 @@ from collections.abc import Iterable, Iterator
 
 # Budgets for the judge's compact view (the report passes None == no file-count cap).
 JUDGE_MAX_FILES = 60
-JUDGE_MAX_INLINE_FILES = 5
-JUDGE_MAX_INLINE_BYTES = 1500
+# The judge grades with tools disabled, so what is inlined here is the ONLY evidence it
+# has. A cap that drops a produced file makes the judge fail rubric items it cannot see —
+# so keep the file cap above what a realistic multi-project workspace produces, and let a
+# long file truncate (below) rather than vanish. Both losses are now announced in-band.
+JUDGE_MAX_INLINE_FILES = 20
+JUDGE_MAX_INLINE_BYTES = 4000
 # The report inlines every text file, but per-file only up to this many bytes (with a
 # truncation note) — a run that legitimately produces a multi-MB CSV/JSON export must not
 # balloon report.md; the full file is still in workspace/.
 REPORT_MAX_INLINE_BYTES = 200_000
 
+# Source/config extensions whose CONTENTS get inlined. An extension missing here is
+# treated as binary and silently reduced to a filename in the tree — which, for the
+# toolless judge, means grading a file it never saw. Keep it wide: the byte/file budgets
+# above bound the cost, not this list.
 _TEXT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".cfg",
-             ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv"}
+             ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv",
+             # .NET / MSBuild
+             ".cs", ".fs", ".vb", ".razor", ".cshtml", ".xaml",
+             ".csproj", ".fsproj", ".vbproj", ".sln", ".slnx",
+             ".props", ".targets", ".config", ".nuspec",
+             # other common source/config the walk can meet
+             ".jsx", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".rb", ".java", ".kt",
+             ".c", ".h", ".cc", ".cpp", ".hpp", ".php", ".pl", ".swift", ".scala",
+             ".sql", ".xml", ".svg", ".bash", ".zsh", ".ps1", ".psm1", ".psd1",
+             ".dockerfile", ".tf", ".tfvars", ".proto",
+             ".graphql", ".rst", ".tex", ".lua", ".r", ".jl", ".dart", ".ex", ".exs"}
+
+# Files with NO extension to match on. `os.path.splitext(".editorconfig")` yields
+# (".editorconfig", "") — a leading dot is not an extension — so a dotfile can never be
+# recognized by _TEXT_EXT no matter what is put in it. Matched case-insensitively on the
+# basename instead. Without this an `.editorconfig`-focused eval grades against nothing.
+_TEXT_NAMES = {".editorconfig", ".gitignore", ".gitattributes", ".dockerignore",
+               ".env", ".npmrc", ".nvmrc", ".prettierrc", ".eslintrc", ".babelrc",
+               "dockerfile", "makefile", "readme", "license", "notice", "codeowners"}
+
+
+def _is_text(path: str) -> bool:
+    """True if this file's CONTENTS should be inlined — by extension, or, for a file that has
+    none (dotfiles above all), by its basename."""
+    base = os.path.basename(path).lower()
+    if base in _TEXT_NAMES:
+        return True
+    return os.path.splitext(base)[1] in _TEXT_EXT
+
 
 # Provisioned skills are inputs, not model output; .git/node_modules/etc. are noise.
 _SKILL_DIRS = (".claude", ".agents", ".antigravity", ".codex")
@@ -210,42 +246,64 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
                  max_bytes: int | None = None, truncate: bool = False,
                  seeded: Iterable[str] = ()) -> str:
     """Inline the contents of text files under `workdir` (and `extra`). With max_files None
-    (the report) every text file is inlined; the judge passes small caps to keep its prompt
-    cheap. A file over `max_bytes` is skipped by default (judge) or, with `truncate=True`
-    (report), inlined up to the cap with a truncation note. Paths in `seeded` are labelled as
-    pre-seeded inputs. Non-text files are skipped (they appear in `file_tree`)."""
+    (the report) every text file is inlined; the judge passes caps to keep its prompt cheap.
+    A file over `max_bytes` is skipped by default or, with `truncate=True`, inlined up to the
+    cap with a truncation note. Paths in `seeded` are labelled as pre-seeded inputs. Non-text
+    files are skipped (they appear in `file_tree`).
+
+    Every text file NOT inlined because a budget ran out is counted and named in a trailing
+    note. Silence there is a correctness bug, not a cosmetic one: the judge grades with tools
+    disabled, so a file dropped without a word is indistinguishable to it from a file the run
+    never produced — and it fails the rubric item for a file that is sitting in workspace/."""
     seeded_set = set(seeded or ())
     chunks: list[str] = []
     used = 0
+    over_cap: list[str] = []     # text files the file-count budget had no room for
+    over_bytes: list[str] = []   # text files skipped whole for exceeding max_bytes
 
-    def _maybe(path: str, label: str) -> bool:
-        """Return False to stop the walk (budget exhausted)."""
-        nonlocal used
-        if max_files is not None and used >= max_files:
-            return False
-        if os.path.splitext(path)[1].lower() not in _TEXT_EXT:
-            return True   # binary: skip contents, keep walking
+    def _candidates() -> Iterator[tuple[str, str]]:
+        for ap, rel in _iter_files(workdir):
+            yield ap, (f"{rel}  [seeded input, not model output]"
+                       if rel in seeded_set else rel)
+        for ap in extra:
+            yield ap, f"{ap}  [outside workspace]"
+
+    for path, label in _candidates():
+        if not _is_text(path):
+            continue          # binary: contents skipped, but file_tree still lists it
         try:
             size = os.path.getsize(path)
-            if max_bytes is not None and size > max_bytes and not truncate:
-                return True
+        except OSError:
+            continue
+        if max_bytes is not None and size > max_bytes and not truncate:
+            over_bytes.append(label)
+            continue
+        # Checked after the filters above so the count reflects files that would really
+        # have been inlined, not every entry left in the walk.
+        if max_files is not None and used >= max_files:
+            over_cap.append(label)
+            continue
+        try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 body = fh.read(max_bytes) if max_bytes is not None else fh.read()
-            if max_bytes is not None and size > max_bytes:
-                body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
-                         "full file in workspace/]")
         except OSError:
-            return True
+            continue
+        if max_bytes is not None and size > max_bytes:
+            body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
+                     "full file in workspace/]")
         chunks.append(f"--- {label} ---\n{body}")
         used += 1
-        return True
 
-    for ap, rel in _iter_files(workdir):
-        label = f"{rel}  [seeded input, not model output]" if rel in seeded_set else rel
-        if not _maybe(ap, label):
-            break
-    else:
-        for ap in extra:
-            if not _maybe(ap, f"{ap}  [outside workspace]"):
-                break
+    if over_cap:
+        chunks.append(f"--- NOT INLINED: {len(over_cap)} more text file(s), over the "
+                      f"{max_files}-file budget ---\n"
+                      + "\n".join(f"  {n}" for n in over_cap)
+                      + "\nTheir contents are absent from this view — do not read that as "
+                        "the files being absent or empty.")
+    if over_bytes:
+        chunks.append(f"--- NOT INLINED: {len(over_bytes)} text file(s) larger than "
+                      f"{max_bytes} bytes ---\n"
+                      + "\n".join(f"  {n}" for n in over_bytes)
+                      + "\nTheir contents are absent from this view — do not read that as "
+                        "the files being absent or empty.")
     return "\n\n".join(chunks)
