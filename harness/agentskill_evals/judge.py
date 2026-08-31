@@ -163,8 +163,13 @@ def _build_prompt(spec: Any, result: RunResult, workdir: str, rubric: list[str],
     # the agent did.
     seeded = seeded_relpaths(spec)
     tree = file_tree(workdir, extra, max_files=JUDGE_MAX_FILES, seeded=seeded)
+    # truncate=True, not skip-whole: the judge has no tools, so a long file dropped entirely
+    # leaves it grading from the agent's own prose — exactly the "reward intent" failure the
+    # instruction above forbids. Its first JUDGE_MAX_INLINE_BYTES, with a truncation note,
+    # costs the same prompt budget and carries the type/constructor/call sites a rubric
+    # nearly always turns on.
     inline = inline_files(workdir, extra, max_files=JUDGE_MAX_INLINE_FILES,
-                          max_bytes=JUDGE_MAX_INLINE_BYTES, seeded=seeded)
+                          max_bytes=JUDGE_MAX_INLINE_BYTES, truncate=True, seeded=seeded)
     rubric_block = "\n".join(f"  {i+1}. {b}" for i, b in enumerate(rubric)) or "  (none)"
 
     parts = [

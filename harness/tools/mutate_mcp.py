@@ -160,6 +160,9 @@ PROXY_VERIFIER = "tools/verify_mcp_proxy.py"
 # readers below from a different program. See `_classify` for where the line falls: what §E17
 # drives is fair game, and this runner's own scoring is not.
 SELF = "tools/mutate_mcp.py"
+# The workspace view the report and the judge are both built from. Production like any
+# other target, and reachable from the selftest, so the path routes it there.
+WSVIEW = "agentskill_evals/workspace_view.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -2834,6 +2837,92 @@ MUTATIONS = [
      "        if not s.is_stdio:\n            raise RuntimeError(",
      "        if False:\n            raise RuntimeError(",
      "mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy"),
+
+    # ---- the inline view's byte budget ----------------------------------------------------
+    # `max_bytes` is compared against `os.path.getsize` and printed as a byte count, so it is
+    # a BYTE budget; a text-mode `read(n)` caps CHARACTERS and overruns it by up to 4x on
+    # UTF-8, with the truncation note misstating what was kept. The arm's fixture is non-ASCII
+    # for exactly this reason — the ASCII one beside it passes under either read.
+    ("M360-the-byte-budget-counts-characters", WSVIEW,
+     '            with open(path, "rb") as fh:\n                raw = fh.read(max_bytes) if max_bytes is not None else fh.read()',
+     '            with open(path, encoding="utf-8", errors="replace") as fh:\n                raw = (fh.read(max_bytes) if max_bytes is not None else fh.read()).encode("utf-8")',
+     "inline.byte_cap_counts_bytes"),
+    # A byte-exact cut can land mid-codepoint. Dropping the half silently reads as a clean
+    # truncation, so the judge cannot tell a cut file from a file that ended there.
+    ("M361-the-split-codepoint-is-dropped-not-marked", WSVIEW,
+     '        body = raw.decode("utf-8", errors="replace")',
+     '        body = raw.decode("utf-8", errors="ignore")',
+     "inline.byte_cap_split_codepoint"),
+
+    # ---- the compact view's NAME lists ----------------------------------------------------
+    # The names of withheld files are unbounded content inside the view whose whole purpose is
+    # a bounded prompt: a workspace of thousands of text files named every one of them, past
+    # the point where inlining them would have been cheaper.
+    ("M362-the-withheld-name-list-is-unbounded", WSVIEW,
+     "    shown = names if limit is None else names[:limit]",
+     "    shown = names",
+     "names.cap_list_is_bounded"),
+    # A silent cut is worse than the explosion: a truncated list of names reads exactly like
+    # the whole of it, so the reader under-counts what is missing instead of over-spending.
+    ("M363-the-cut-name-list-does-not-say-it-was-cut", WSVIEW,
+     "    if hidden:\n        lines.append(",
+     "    if False:\n        lines.append(",
+     "names.cap_elision_counted"),
+    # The count is the fact the note exists to carry — a judge that knows evidence is withheld
+    # does not mark the file absent. Capping the count as well as the names loses it.
+    ("M364-the-header-counts-only-the-names-it-printed", WSVIEW,
+     'f"--- NOT INLINED: {len(over_cap)} more text file(s), over the "',
+     'f"--- NOT INLINED: {len(over_cap[:JUDGE_MAX_NAMED_FILES])} more text file(s), over the "',
+     "names.cap_total_is_exact"),
+    # ...and the dual: the report has no prompt to protect, and an outside-write dropped from
+    # it is a lost safety signal, not a saved token.
+    ("M365-the-report-truncates-the-outside-writes-too", WSVIEW,
+     "            None if max_files is None else JUDGE_MAX_NAMED_FILES))",
+     "            JUDGE_MAX_NAMED_FILES))",
+     "names.tree_report_lists_all"),
+
+    # ---- host credentials must not be inlined into the judge prompt or the report ---------
+    # `writes_outside_workspace()` is computed from `file_paths_touched()`, which counts a READ
+    # as much as a write, so a run that merely opened the operator's `~/.npmrc` handed the
+    # harness that file to publish — into a prompt sent to a third-party model, and into a
+    # report.md that outlives the run.
+    ("M366-a-host-credential-file-is-inlined-anyway", WSVIEW,
+     "        if outside and is_secret_name(path):",
+     "        if False and is_secret_name(path):",
+     "secrets.judge.body_withheld_leak_npmtoken"),
+    # The dual, and the reason the rule is scoped to OUTSIDE rather than to the name: a `.env`
+    # under the workspace is the model's own output, and an eval whose task is to write one
+    # has to stay gradable. A name-only rule passes every leak arm above and blinds the judge.
+    ("M367-the-name-rule-also-swallows-the-models-own-output", WSVIEW,
+     "        if outside and is_secret_name(path):",
+     "        if is_secret_name(path):",
+     "secrets.judge.workspace_env_still_inlined"),
+    # Withheld is not vanished. The judge grades with tools disabled, so a file dropped without
+    # a word is indistinguishable from one the run never touched — and the isolation verdict is
+    # read off exactly these paths.
+    ("M368-the-withheld-file-is-dropped-without-a-word", WSVIEW,
+     "            secret.append(label)\n            continue",
+     "            continue",
+     "secrets.judge.path_still_named_npmrc"),
+    # Deny-everything scores full marks on every arm above: it withholds the leak markers by
+    # withholding everything, including the outside artifact the view exists to surface.
+    ("M369-every-outside-file-is-treated-as-a-credential", WSVIEW,
+     ("    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):\n"
+      "        return True\n"
+      "    return os.path.splitext(base)[1] in _SECRET_EXT"),
+     "    return True",
+     "secrets.judge.outside_nonsecret_still_inlined"),
+    # The rule is wider than the two names it was reported for, in both directions it was
+    # widened: the `.env` FAMILY by prefix...
+    ("M370-only-the-exact-names-count-not-the-env-family", WSVIEW,
+     "    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):",
+     "    if base in _SECRET_NAMES:",
+     "secrets.name_env"),
+    # ...and key material by extension, which no name list can enumerate.
+    ("M371-key-material-is-not-recognized-by-extension", WSVIEW,
+     "    return os.path.splitext(base)[1] in _SECRET_EXT",
+     "    return False",
+     "secrets.name_server.pem"),
 
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,

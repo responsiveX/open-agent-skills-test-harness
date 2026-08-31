@@ -6222,6 +6222,17 @@ def _check_exec_process_tree_handles(failures, verbose):
         exec_mod._win32_kernel32 = saved_k32
 
 
+def _inlined_body(out: str, name: str) -> str:
+    """The body inline_files emitted for `name`, without its header or truncation note.
+    Returns "" when the file is absent from the view, so a check on the body cannot pass
+    by finding nothing."""
+    marker = f"--- {name} ---\n"
+    if marker not in out:
+        return ""
+    body = out.split(marker, 1)[1].split("\n\n--- ", 1)[0]
+    return body.split("\n\u2026 [truncated at", 1)[0]
+
+
 def _check_inline_truncation(failures, verbose):
     """The report inlines every text file but must cap each one: a legitimate multi-MB CSV
     export would otherwise land verbatim in report.md. truncate=True (report) inlines up to
@@ -6243,15 +6254,333 @@ def _check_inline_truncation(failures, verbose):
                and "x" * 11 not in out_trunc,
                f"oversize file inlined up to the cap with a note: {out_trunc!r}",
                failures, verbose)
+        # Without truncate the CONTENTS are still withheld — but the file must be NAMED as
+        # withheld. Returning a bare "" made a dropped file indistinguishable from a file the
+        # run never produced, which is how a toolless judge failed rubric items for code that
+        # was sitting in workspace/.
         out_skip = inline_files(ws, max_bytes=10)
-        _check("inline.judge_still_skips", out_skip == "",
-               f"without truncate, an oversize file is skipped entirely: {out_skip!r}",
+        _check("inline.oversize_contents_withheld",
+               "x" * 11 not in out_skip,
+               f"without truncate, an oversize file's contents stay out: {out_skip!r}",
                failures, verbose)
+        _check("inline.oversize_skip_announced",
+               "NOT INLINED" in out_skip and "big.csv" in out_skip,
+               f"a skipped oversize file is named, not silently dropped: {out_skip!r}",
+               failures, verbose)
+        # A cap labelled in bytes must be enforced in BYTES. A text-mode read(n) caps
+        # CHARACTERS, so an all-ASCII fixture (big.csv above) passes either way and
+        # exercises only the path where the bug cannot appear. U+00E9 is 2 bytes per
+        # character: reading 10 CHARACTERS of it yields 20 bytes, twice the promised cap,
+        # and the "truncated at 10 bytes" note would then misstate what was kept.
+        u8 = os.path.join(ws, "utf8.txt")
+        with open(u8, "w", encoding="utf-8") as fh:
+            fh.write("é" * 40)            # 40 characters, 80 bytes
+        kept = _inlined_body(inline_files(ws, max_bytes=10, truncate=True), "utf8.txt")
+        _check("inline.byte_cap_counts_bytes",
+               kept == "é" * 5 and len(kept.encode("utf-8")) == 10,
+               f"a 10-BYTE cap keeps 5 two-byte characters, not 10 of them: {kept!r}",
+               failures, verbose)
+        # An odd cap lands mid-codepoint: errors="replace" must absorb the split half
+        # rather than raising, and must not smuggle it through as anything else.
+        kept9 = _inlined_body(inline_files(ws, max_bytes=9, truncate=True), "utf8.txt")
+        _check("inline.byte_cap_split_codepoint",
+               kept9 == "é" * 4 + "�",
+               f"a cap landing mid-codepoint decodes to a replacement char: {kept9!r}",
+               failures, verbose)
+        os.remove(u8)
+
         out_full = inline_files(ws)
         _check("inline.uncapped_full", "x" * 100 in out_full,
                "no cap inlines the whole file", failures, verbose)
+        _check("inline.uncapped_no_marker", "NOT INLINED" not in out_full,
+               "an uncapped (report) view drops nothing, so it emits no marker",
+               failures, verbose)
     finally:
         shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_inline_text_kinds(failures, verbose):
+    """inline_files must recognize the source files the evals actually produce. The contents
+    it returns are the ONLY evidence the judge has (it grades with tools disabled), so an
+    extension missing from the allowlist is not cosmetic: the file degrades to a bare name in
+    the tree and the judge fails every rubric item that depends on reading it.
+
+    Regression: _TEXT_EXT held no .NET extension at all, so every .cs/.csproj/.slnx workspace
+    inlined as the empty string and whole eval suites scored 0 with the judge reporting it
+    could not see the code. .editorconfig covers the second half of that bug — splitext() on a
+    dotfile yields no extension, so no _TEXT_EXT entry can ever match one."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files
+
+    print("inline text kinds:")
+    ws = tempfile.mkdtemp(prefix="ase-kinds-")
+    try:
+        os.makedirs(os.path.join(ws, "src"))
+        written = {
+            os.path.join("src", "Payment.cs"): "public sealed class Payment { }",
+            os.path.join("src", "App.csproj"): "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+            "Contoso.slnx": "<Solution />",
+            "Directory.Build.props": "<Project><PropertyGroup /></Project>",
+            ".editorconfig": "[*.cs]\ndotnet_diagnostic.CA1707.severity = error",
+        }
+        for rel, body in written.items():
+            with open(os.path.join(ws, rel), "w") as fh:
+                fh.write(body)
+        with open(os.path.join(ws, "logo.png"), "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n")
+
+        out = inline_files(ws)
+        for rel, body in written.items():
+            _check(f"inline.kind{os.path.splitext(rel)[1] or '_dotfile'}"
+                   f".{os.path.basename(rel)}",
+                   body in out,
+                   f"{rel} contents reach the judge", failures, verbose)
+        _check("inline.binary_still_excluded", "PNG" not in out,
+               "a real binary is still not inlined", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_inline_secret_files(failures, verbose):
+    """A credential-bearing file the run reached OUTSIDE the workspace must never have its
+    CONTENTS inlined — not into the judge prompt (which is sent to a third-party model) nor
+    into report.md (which is durable and gets pasted into issues).
+
+    The path that makes this reachable: `writes_outside_workspace()` is computed from
+    `file_paths_touched()`, which counts a READ as much as a write, so an agent that merely
+    opened the operator's `~/.npmrc` handed the harness that file to publish. `.env` and
+    `.npmrc` are only the visible instances — `auth.json` is a codex credential store and
+    `.json` has always been inlinable, so a fix that stopped at the two reported names would
+    have left the class open.
+
+    Scope is asserted in both directions, because a rule that withheld everything would pass
+    every leak arm here while destroying two things the module exists to do: inline the model's
+    own `.env`, and show an artifact the run wrote outside the workspace."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files, is_secret_name
+
+    print("outside-workspace secrets:")
+
+    # The predicate on its own, on the cases that distinguish it from "the reported names".
+    for name, want, why in (
+        (".env", True, "the reported name"),
+        (".env.local", True, "the .env FAMILY, not just the bare name"),
+        (".envrc", True, "direnv, which holds the same thing"),
+        (".npmrc", True, "the other reported name"),
+        (".NPMRC", True, "matched case-insensitively"),
+        ("auth.json", True, "a codex credential store, and .json inlines"),
+        ("hosts.yml", True, "a gh credential store, and .yml inlines"),
+        ("id_ed25519", True, "a private key"),
+        ("server.pem", True, "key material by extension"),
+        ("README.md", False, "an ordinary file is NOT swept up"),
+        ("environment.yml", False, "...nor is one that merely starts like one"),
+    ):
+        _check(f"secrets.name_{name.lower().strip('.')}",
+               is_secret_name(os.path.join("some", "dir", name)) is want,
+               f"is_secret_name({name}) is {want} - {why}", failures, verbose)
+
+    ws = tempfile.mkdtemp(prefix="ase-secret-ws-")
+    outside = tempfile.mkdtemp(prefix="ase-secret-out-")
+    try:
+        # In the workspace: the model's own output. Must still be graded.
+        with open(os.path.join(ws, ".env"), "w") as fh:
+            fh.write("DATABASE_URL=postgres://localhost/app_MINE")
+
+        # Outside: the operator's machine. Distinct marker per file so no arm can pass on
+        # another arm's evidence.
+        host = {".env": "AWS_SECRET_ACCESS_KEY=LEAK_HOSTENV",
+                ".npmrc": "//registry.npmjs.org/:_authToken=LEAK_NPMTOKEN",
+                ".env.local": "STRIPE_KEY=LEAK_ENVLOCAL",
+                "auth.json": '{"tokens": {"access_token": "LEAK_AUTHJSON"}}',
+                "report.md": "# LEAK_NOTASECRET\n\nthe artifact the run really wrote"}
+        extra = []
+        for name, body in host.items():
+            ap = os.path.join(outside, name)
+            with open(ap, "w") as fh:
+                fh.write(body)
+            extra.append(ap)
+
+        for view, kwargs in (("judge", {"max_files": 20, "max_bytes": 4000, "truncate": True}),
+                             ("report", {"max_bytes": 200000, "truncate": True})):
+            out = inline_files(ws, extra, **kwargs)
+
+            # A positive fact FIRST: an empty string passes every "LEAK not in out" check
+            # below, and so does a run of inline_files that never looked at a file at all.
+            _check(f"secrets.{view}.view_is_not_empty",
+                   "--- " in out and "CONTENTS WITHHELD:" in out,
+                   f"the view has content and states the withholding: {out[:80]!r}",
+                   failures, verbose)
+
+            # LEAK_ENVLOCAL is the one marker guarded by two facts at once: `.env.local` is
+            # also not in _TEXT_EXT/_TEXT_NAMES, so it would not inline even unguarded. Kept
+            # because that is a property of a list this rule does not own, and the arm that
+            # actually discriminates for the .env FAMILY is path_still_named_env_local below
+            # (unguarded, the file is dropped with no note at all).
+            for marker in ("LEAK_HOSTENV", "LEAK_NPMTOKEN", "LEAK_ENVLOCAL", "LEAK_AUTHJSON"):
+                _check(f"secrets.{view}.body_withheld_{marker.lower()}",
+                       marker not in out,
+                       f"{marker} never reaches the {view} view", failures, verbose)
+
+            # Withheld is not vanished: the judge must be able to tell a file it cannot see
+            # from a file that was never there, and the isolation verdict is read off paths.
+            for name in (".env", ".npmrc", ".env.local", "auth.json"):
+                _check(f"secrets.{view}.path_still_named_{name.strip('.').replace('.', '_')}",
+                       os.path.join(outside, name) in out,
+                       f"the {name} PATH is still named in the {view} view", failures, verbose)
+
+            _check(f"secrets.{view}.count_is_exact",
+                   "CONTENTS WITHHELD: 4 file(s)" in out,
+                   f"the note counts every withheld file: {out[-400:]!r}", failures, verbose)
+
+            # The other direction, twice: neither the outside artifact the module exists to
+            # surface nor the model's own .env may be caught by this rule.
+            _check(f"secrets.{view}.outside_nonsecret_still_inlined",
+                   "LEAK_NOTASECRET" in out,
+                   f"an ordinary file written outside the workspace still inlines ({view})",
+                   failures, verbose)
+            _check(f"secrets.{view}.workspace_env_still_inlined",
+                   "app_MINE" in out,
+                   f"the model's OWN .env is still graded ({view})", failures, verbose)
+
+        # Negative control on the note itself: it must be absent when nothing was withheld,
+        # or "the note is present" above proves nothing about the withholding.
+        clean = inline_files(ws)
+        _check("secrets.no_note_without_secrets",
+               "CONTENTS WITHHELD" not in clean and "app_MINE" in clean,
+               f"a run that touched nothing outside gets no withholding note: {clean!r}",
+               failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def _check_inline_file_cap_announced(failures, verbose):
+    """Hitting the file-count cap must be announced. file_tree already prints a truncation
+    line; inline_files stopped silently, so a partially-graded case looked byte-identical to a
+    fully-graded one and the judge had no way to know evidence was missing."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files
+
+    print("inline file-cap marker:")
+    ws = tempfile.mkdtemp(prefix="ase-cap-")
+    try:
+        for i in range(7):
+            with open(os.path.join(ws, f"F{i}.cs"), "w") as fh:
+                fh.write(f"class F{i} {{ }}")
+        out = inline_files(ws, max_files=5)
+        _check("inline.cap_inlines_budget", out.count("--- F") == 5,
+               f"exactly max_files files inlined: {out.count('--- F')}", failures, verbose)
+        _check("inline.cap_announced",
+               "NOT INLINED" in out and "F5.cs" in out and "F6.cs" in out,
+               f"the two files over the cap are named: {out[-300:]!r}", failures, verbose)
+        _check("inline.cap_counts_only_inlinable", "2 more text file(s)" in out,
+               f"the count reflects withheld TEXT files: {out[-300:]!r}", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _check_view_name_lists_bounded(failures, verbose):
+    """The names of files a budget WITHHELD are unbounded content in a view whose whole point
+    is a bounded prompt: a workspace with thousands of text files put every one of their names
+    into the judge prompt, spending more than inlining them would have. The COUNT is what the
+    note has to carry (a judge that knows evidence is missing does not mark the file absent),
+    so the count stays exact and only the enumeration is cut — and the cut says how much it
+    cut, or the reader silently reads a truncated list as the whole of it.
+
+    Three lists, one rule: over-the-file-cap, over-the-byte-cap, and the tree's
+    written-OUTSIDE-the-workspace paths, which are bounded only by what the run touched."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import JUDGE_MAX_NAMED_FILES as CAP
+    from .workspace_view import file_tree, inline_files
+
+    def _listed(block: str, ext: str) -> int:
+        """How many filenames the note actually enumerates — counted from the rendered text,
+        not from what the code believed it wrote."""
+        return sum(1 for ln in block.splitlines()
+                   if ln.startswith("  ") and ln.strip().split("  ")[0].endswith(ext))
+
+    print("view name-list bounds:")
+    n = CAP + 12          # enough over the cap that an off-by-one cannot pass this by luck
+    ws = tempfile.mkdtemp(prefix="ase-names-")
+    try:
+        for i in range(n + 3):
+            with open(os.path.join(ws, f"N{i:03d}.cs"), "w") as fh:
+                fh.write("x" * 50)
+
+        over = inline_files(ws, max_files=3)
+        withheld = n + 3 - 3
+        _check("names.cap_total_is_exact", f"{withheld} more text file(s)" in over,
+               f"the header still counts every withheld file: {over[:120]!r}",
+               failures, verbose)
+        _check("names.cap_list_is_bounded", _listed(over, ".cs") == CAP,
+               f"the enumeration is cut to the cap, not {_listed(over, '.cs')} names",
+               failures, verbose)
+        _check("names.cap_elision_counted",
+               f"(+ {withheld - CAP} more" in over,
+               f"the cut says how many names it dropped: {over[-200:]!r}", failures, verbose)
+        # The negative control the two checks above cannot give: a name PAST the cap must be
+        # gone. Without it, an implementation that listed everything and appended an elision
+        # line would score full marks.
+        _check("names.cap_last_name_omitted", f"N{n + 2:03d}.cs" not in over,
+               "a name past the cap is really absent from the prompt", failures, verbose)
+        _check("names.cap_first_name_kept", "N003.cs" in over,
+               "...while the names inside the cap are still there", failures, verbose)
+
+        # Same rule, the byte-budget list (truncate=False), which is a different code path.
+        big = inline_files(ws, max_bytes=10)
+        _check("names.bytes_total_is_exact", f"{n + 3} text file(s) larger than" in big,
+               f"every oversized file is counted: {big[:120]!r}", failures, verbose)
+        _check("names.bytes_list_is_bounded", _listed(big, ".cs") == CAP,
+               f"the enumeration is cut: {_listed(big, '.cs')} names", failures, verbose)
+        _check("names.bytes_elision_counted", f"(+ {n + 3 - CAP} more" in big,
+               f"the cut is announced with its count: {big[-200:]!r}", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+    # The tree's outside-writes list. Capped for the judge, WHOLE for the report — the report
+    # has no prompt to protect and a dropped outside-write there is a lost safety signal.
+    empty = tempfile.mkdtemp(prefix="ase-names-tree-")
+    try:
+        outside = tempfile.mkdtemp(prefix="ase-names-out-")
+        paths = []
+        for i in range(CAP + 5):
+            ap = os.path.join(outside, f"O{i:03d}.txt")
+            with open(ap, "w") as fh:
+                fh.write("x")
+            paths.append(ap)
+        try:
+            judged = file_tree(empty, paths, max_files=60)
+            _check("names.tree_list_is_bounded", _listed(judged, ".txt") == CAP,
+                   f"the judge's tree lists at most the cap: {_listed(judged, '.txt')}",
+                   failures, verbose)
+            _check("names.tree_elision_counted", "(+ 5 more" in judged,
+                   f"...and says how many it left out: {judged[-200:]!r}", failures, verbose)
+            _check("names.tree_last_name_omitted",
+                   f"O{CAP + 4:03d}.txt" not in judged,
+                   "a path past the cap is really absent", failures, verbose)
+            report = file_tree(empty, paths)          # max_files=None — the report
+            _check("names.tree_report_lists_all",
+                   _listed(report, ".txt") == CAP + 5 and f"O{CAP + 4:03d}.txt" in report,
+                   f"the uncapped report still lists every outside write: "
+                   f"{_listed(report, '.txt')}", failures, verbose)
+            _check("names.tree_report_has_no_elision", "names omitted" not in report,
+                   "...with no elision line to explain", failures, verbose)
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
 
 
 def _check_model_error_heuristic(failures, verbose):
@@ -9203,6 +9532,10 @@ def _run_selftest_checks(verbose: bool = False) -> int:
 
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _section(_check_inline_truncation, failures, verbose)
+    _section(_check_inline_text_kinds, failures, verbose)
+    _section(_check_inline_secret_files, failures, verbose)
+    _section(_check_inline_file_cap_announced, failures, verbose)
+    _section(_check_view_name_lists_bounded, failures, verbose)
 
     # model-rejection annotation only fires on actual rejections
     _section(_check_model_error_heuristic, failures, verbose)

@@ -17,15 +17,98 @@ from collections.abc import Iterable, Iterator
 
 # Budgets for the judge's compact view (the report passes None == no file-count cap).
 JUDGE_MAX_FILES = 60
-JUDGE_MAX_INLINE_FILES = 5
-JUDGE_MAX_INLINE_BYTES = 1500
+# The judge grades with tools disabled, so what is inlined here is the ONLY evidence it
+# has. A cap that drops a produced file makes the judge fail rubric items it cannot see —
+# so keep the file cap above what a realistic multi-project workspace produces, and let a
+# long file truncate (below) rather than vanish. Both losses are now announced in-band.
+JUDGE_MAX_INLINE_FILES = 20
+JUDGE_MAX_INLINE_BYTES = 4000
 # The report inlines every text file, but per-file only up to this many bytes (with a
 # truncation note) — a run that legitimately produces a multi-MB CSV/JSON export must not
 # balloon report.md; the full file is still in workspace/.
 REPORT_MAX_INLINE_BYTES = 200_000
+# Cap on the FILENAME lists in the compact view's notes: the files a budget withheld, and
+# the files written outside the workspace. Those names exist so the judge knows evidence is
+# missing — but a workspace holding thousands of text files would spend more prompt budget
+# naming files it is told it cannot see than the budgets above saved by not inlining them,
+# which is the very cost those budgets exist to bound. Only the ENUMERATION is cut; the
+# total stays exact in the note that introduces it.
+JUDGE_MAX_NAMED_FILES = 25
 
+# Source/config extensions whose CONTENTS get inlined. An extension missing here is
+# treated as binary and silently reduced to a filename in the tree — which, for the
+# toolless judge, means grading a file it never saw. Keep it wide: the byte/file budgets
+# above bound the cost, not this list.
 _TEXT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".cfg",
-             ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv"}
+             ".ini", ".js", ".ts", ".html", ".css", ".sh", ".csv",
+             # .NET / MSBuild
+             ".cs", ".fs", ".vb", ".razor", ".cshtml", ".xaml",
+             ".csproj", ".fsproj", ".vbproj", ".sln", ".slnx",
+             ".props", ".targets", ".config", ".nuspec",
+             # other common source/config the walk can meet
+             ".jsx", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".rb", ".java", ".kt",
+             ".c", ".h", ".cc", ".cpp", ".hpp", ".php", ".pl", ".swift", ".scala",
+             ".sql", ".xml", ".svg", ".bash", ".zsh", ".ps1", ".psm1", ".psd1",
+             ".dockerfile", ".tf", ".tfvars", ".proto",
+             ".graphql", ".rst", ".tex", ".lua", ".r", ".jl", ".dart", ".ex", ".exs"}
+
+# Files with NO extension to match on. `os.path.splitext(".editorconfig")` yields
+# (".editorconfig", "") — a leading dot is not an extension — so a dotfile can never be
+# recognized by _TEXT_EXT no matter what is put in it. Matched case-insensitively on the
+# basename instead. Without this an `.editorconfig`-focused eval grades against nothing.
+# `.env` and `.npmrc` belong here even though they conventionally hold secrets: inside the
+# workspace they are the model's own output and an eval that asks for one has to be gradable.
+# What keeps a HOST `.env` out of the judge prompt is `is_secret_name` below, applied in
+# `inline_files` to outside-the-workspace paths only — do not re-fix it by deleting them here,
+# which would blind the judge to work it must grade and still inline `~/.codex/auth.json`.
+_TEXT_NAMES = {".editorconfig", ".gitignore", ".gitattributes", ".dockerignore",
+               ".env", ".npmrc", ".nvmrc", ".prettierrc", ".eslintrc", ".babelrc",
+               "dockerfile", "makefile", "readme", "license", "notice", "codeowners"}
+
+
+def _is_text(path: str) -> bool:
+    """True if this file's CONTENTS should be inlined — by extension, or, for a file that has
+    none (dotfiles above all), by its basename."""
+    base = os.path.basename(path).lower()
+    if base in _TEXT_NAMES:
+        return True
+    return os.path.splitext(base)[1] in _TEXT_EXT
+
+
+# Names that conventionally hold a credential. The single place that decides what
+# "credential-bearing" means, so a newly-learned way a file can hold a secret joins the
+# reasons already here rather than becoming a second check one caller consults.
+#
+# Several of these are ALSO in _TEXT_NAMES / _TEXT_EXT — `.env` and `.npmrc` are there
+# deliberately, because an eval whose task is to write one must be gradable — so this is
+# not an exclusion from inlining, only from inlining a file the harness reached OUTSIDE
+# the workspace (see `inline_files`).
+_SECRET_NAMES = {".npmrc", ".netrc", "_netrc", ".pypirc", ".pgpass", ".my.cnf",
+                 ".htpasswd", ".dockercfg", ".git-credentials", ".gitconfig",
+                 "credentials", "credentials.json", "auth.json", "token.json",
+                 "secrets.json", "secrets.yaml", "secrets.yml",
+                 "hosts.yml", "hosts.yaml",
+                 "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+# Matched as a PREFIX so the whole `.env` family is covered — `.env.local`,
+# `.env.production`, `.envrc` — not just the bare name the reproduction happened to use.
+_SECRET_PREFIXES = (".env",)
+# Key/certificate material. None of these is in _TEXT_EXT today, so none would be inlined
+# anyway; they are listed because this predicate must stay right on its own terms rather
+# than by depending on a list it does not control.
+_SECRET_EXT = {".pem", ".key", ".pfx", ".p12", ".jks", ".keystore", ".asc", ".gpg"}
+
+
+def is_secret_name(path: str) -> bool:
+    """True if this file's NAME marks it as a conventional credential store.
+
+    A name test, not a content test: it says what the file is for, which is the only thing
+    knowable without reading — and reading it into a decision is the disclosure being
+    avoided."""
+    base = os.path.basename(path).lower()
+    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):
+        return True
+    return os.path.splitext(base)[1] in _SECRET_EXT
+
 
 # Provisioned skills are inputs, not model output; .git/node_modules/etc. are noise.
 _SKILL_DIRS = (".claude", ".agents", ".antigravity", ".codex")
@@ -183,11 +266,30 @@ def leaked_skill_reads(
     return hits
 
 
+def _named_lines(names: list[str], limit: int | None) -> str:
+    """`names` as indented lines, at most `limit` of them, followed by a line saying how many
+    were left out. `limit=None` lists every name (the report, which has no prompt to protect).
+
+    The elision line is DERIVED from the same list the caller counts in its header, so the two
+    can never disagree about how many files there are: the header keeps the exact total even
+    when the enumeration under it is cut."""
+    shown = names if limit is None else names[:limit]
+    lines = [f"  {n}" for n in shown]
+    hidden = len(names) - len(shown)
+    if hidden:
+        lines.append(f"  ... (+ {hidden} more, names omitted to bound this view — "
+                     "withheld here, NOT missing from the run)")
+    return "\n".join(lines)
+
+
 def file_tree(workdir: str, extra: list[str] = (), max_files: int | None = None,
               seeded: Iterable[str] = ()) -> str:
     """A flat listing of every file under `workdir` (skill dirs / noise excluded), plus any
     `extra` paths written outside it. `max_files=None` lists everything (the report); the judge
-    passes a cap. Paths in `seeded` (workspace-relative) are annotated as pre-seeded inputs."""
+    passes a cap, which bounds the `extra` list too — it grows with whatever the run happened
+    to touch, and the report is the view with no prompt to protect, so it is the one that must
+    show every outside write. Paths in `seeded` (workspace-relative) are annotated as
+    pre-seeded inputs."""
     seeded_set = set(seeded or ())
     lines: list[str] = []
     count = 0
@@ -201,8 +303,13 @@ def file_tree(workdir: str, extra: list[str] = (), max_files: int | None = None,
         count += 1
     if truncated:
         lines.append(f"  ... (+ more, truncated at {max_files})")
-    for ap in extra:
-        lines.append(f"  {ap}   [written OUTSIDE the workspace by this run]")
+    if extra:
+        # Capped for the same reason the walk above is: this list is bounded only by
+        # how many distinct paths the run happened to touch. The count survives the
+        # cut, so an unlisted outside-write is still one the reader is told about.
+        lines.append(_named_lines(
+            [f"{ap}   [written OUTSIDE the workspace by this run]" for ap in extra],
+            None if max_files is None else JUDGE_MAX_NAMED_FILES))
     return "\n".join(lines) if lines else "  (workspace empty)"
 
 
@@ -210,42 +317,115 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
                  max_bytes: int | None = None, truncate: bool = False,
                  seeded: Iterable[str] = ()) -> str:
     """Inline the contents of text files under `workdir` (and `extra`). With max_files None
-    (the report) every text file is inlined; the judge passes small caps to keep its prompt
-    cheap. A file over `max_bytes` is skipped by default (judge) or, with `truncate=True`
-    (report), inlined up to the cap with a truncation note. Paths in `seeded` are labelled as
-    pre-seeded inputs. Non-text files are skipped (they appear in `file_tree`)."""
+    (the report) every text file is inlined; the judge passes caps to keep its prompt cheap.
+    A file over `max_bytes` is skipped by default or, with `truncate=True`, inlined up to the
+    cap with a truncation note. Paths in `seeded` are labelled as pre-seeded inputs. Non-text
+    files are skipped (they appear in `file_tree`).
+
+    Every text file NOT inlined because a budget ran out is COUNTED in a trailing note, and
+    named there up to JUDGE_MAX_NAMED_FILES. Silence there is a correctness bug, not a
+    cosmetic one: the judge grades with tools disabled, so a file dropped without a word is
+    indistinguishable to it from a file the run never produced — and it fails the rubric item
+    for a file that is sitting in workspace/. The count is what carries that, so it stays
+    exact however many names the cap withholds.
+
+    One class of file is withheld for a reason that is not a budget: a path OUTSIDE the
+    workspace whose name marks it a credential store (`is_secret_name`). Those are counted and
+    named in their own trailing note, never inlined. See the loop for why the rule is scoped to
+    outside-the-workspace rather than to the name alone."""
     seeded_set = set(seeded or ())
     chunks: list[str] = []
     used = 0
+    over_cap: list[str] = []     # text files the file-count budget had no room for
+    over_bytes: list[str] = []   # text files skipped whole for exceeding max_bytes
+    secret: list[str] = []       # outside files whose NAME marks them a credential store
 
-    def _maybe(path: str, label: str) -> bool:
-        """Return False to stop the walk (budget exhausted)."""
-        nonlocal used
-        if max_files is not None and used >= max_files:
-            return False
-        if os.path.splitext(path)[1].lower() not in _TEXT_EXT:
-            return True   # binary: skip contents, keep walking
+    def _candidates() -> Iterator[tuple[str, str, bool]]:
+        for ap, rel in _iter_files(workdir):
+            yield ap, (f"{rel}  [seeded input, not model output]"
+                       if rel in seeded_set else rel), False
+        for ap in extra:
+            yield ap, f"{ap}  [outside workspace]", True
+
+    for path, label, outside in _candidates():
+        # An `extra` path is here because the run NAMED it in a tool call, and
+        # `writes_outside_workspace()` is computed from `file_paths_touched()`, which counts a
+        # READ as much as a write. So a run that merely opened `~/.npmrc` would otherwise have
+        # that file's auth token copied verbatim into the judge prompt (a third-party model)
+        # and into report.md (durable, and routinely pasted into an issue) — a disclosure the
+        # run never asked for and the operator never saw. Nothing outside the workspace is this
+        # run's output, so withholding it costs the judge no evidence it is owed: the PATH is
+        # still named here and in the tree, and the path is what the isolation verdict needs.
+        #
+        # Scoped to `outside`, not to the name alone, because inside the workspace the opposite
+        # holds — a `.env` there IS the model's own work (that is why `.env` is in _TEXT_NAMES),
+        # and an eval that asks for one must stay gradable.
+        #
+        # This bounds the ACCIDENTAL disclosure: the incidental read of a well-known credential
+        # store. Being a name denylist it cannot bound a run that sets out to exfiltrate — such
+        # a run can put any bytes it likes in its final message, which the judge sees regardless
+        # of anything decided here.
+        if outside and is_secret_name(path):
+            secret.append(label)
+            continue
+        if not _is_text(path):
+            continue          # binary: contents skipped, but file_tree still lists it
         try:
             size = os.path.getsize(path)
-            if max_bytes is not None and size > max_bytes and not truncate:
-                return True
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                body = fh.read(max_bytes) if max_bytes is not None else fh.read()
-            if max_bytes is not None and size > max_bytes:
-                body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
-                         "full file in workspace/]")
         except OSError:
-            return True
+            continue
+        if max_bytes is not None and size > max_bytes and not truncate:
+            over_bytes.append(label)
+            continue
+        # Checked after the filters above so the count reflects files that would really
+        # have been inlined, not every entry left in the walk.
+        if max_files is not None and used >= max_files:
+            over_cap.append(label)
+            continue
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(max_bytes) if max_bytes is not None else fh.read()
+        except OSError:
+            continue
+        # Read bytes and decode here rather than reading text with a cap: `max_bytes` is a
+        # BYTE budget — it is compared against os.path.getsize() above and reported as bytes
+        # in the note below — but a text-mode read(n) caps CHARACTERS, so any non-ASCII file
+        # would overrun the cap (up to 4x on UTF-8) and the note would misstate what was kept.
+        # errors="replace" also absorbs the codepoint the byte-exact cut may have split.
+        body = raw.decode("utf-8", errors="replace")
+        body = body.replace("\r\n", "\n").replace("\r", "\n")  # as text mode did
+        if max_bytes is not None and size > max_bytes:
+            body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
+                     "full file in workspace/]")
         chunks.append(f"--- {label} ---\n{body}")
         used += 1
-        return True
 
-    for ap, rel in _iter_files(workdir):
-        label = f"{rel}  [seeded input, not model output]" if rel in seeded_set else rel
-        if not _maybe(ap, label):
-            break
-    else:
-        for ap in extra:
-            if not _maybe(ap, f"{ap}  [outside workspace]"):
-                break
+    # Both notes exist only because a budget was exceeded, so a budget is in force by
+    # construction and their name lists are always capped — unlike the tree's, which
+    # is primary content when the report asks for all of it.
+    if over_cap:
+        chunks.append(f"--- NOT INLINED: {len(over_cap)} more text file(s), over the "
+                      f"{max_files}-file budget ---\n"
+                      + _named_lines(over_cap, JUDGE_MAX_NAMED_FILES)
+                      + "\nTheir contents are absent from this view — do not read that as "
+                        "the files being absent or empty.")
+    if over_bytes:
+        chunks.append(f"--- NOT INLINED: {len(over_bytes)} text file(s) larger than "
+                      f"{max_bytes} bytes ---\n"
+                      + _named_lines(over_bytes, JUDGE_MAX_NAMED_FILES)
+                      + "\nTheir contents are absent from this view — do not read that as "
+                        "the files being absent or empty.")
+    # Announced for the same reason the two notes above are: a file dropped without a word
+    # is indistinguishable, to a judge grading with tools disabled, from a file the run
+    # never produced. Unlike them this note does not imply a budget was in force, so its
+    # enumeration is capped on the rule the TREE uses rather than theirs — every name in the
+    # uncapped (report) view, JUDGE_MAX_NAMED_FILES in the judge's. The count stays exact.
+    if secret:
+        chunks.append(f"--- CONTENTS WITHHELD: {len(secret)} file(s) outside the workspace "
+                      "whose name marks them a credential store ---\n"
+                      + _named_lines(secret,
+                                     None if max_files is None else JUDGE_MAX_NAMED_FILES)
+                      + "\nThe run touched these paths. Their contents are host machine "
+                        "state, not this run's output, and are deliberately not reproduced "
+                        "here or in the report — grade the path, not the contents.")
     return "\n\n".join(chunks)
