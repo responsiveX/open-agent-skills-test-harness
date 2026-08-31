@@ -17,8 +17,9 @@ from . import __version__
 from .adapters import adapter_names, all_adapters, get_adapter
 from .isolation import resolve_visible_skills
 from .judge import Judge
+from .merge import find_shards, merge_runs
 from .progress import Progress
-from .runner import Runner, _cell_text, _safe, render_matrix
+from .runner import Runner, _cell_text, _safe, parallel_unsafe_reason, render_matrix
 from .spec import (
     REASONING_EFFORT_LEVELS,
     SKILLS_SUBDIR,
@@ -550,18 +551,23 @@ def cmd_run(args) -> int:
     # every other misconfiguration gets. `jobs` is resolved by this point including the
     # scenario-file override, so a YAML that sets `jobs:` lands here as well.
     #
-    # Gated on the adapter, NOT on isolation: an isolated home is a symlink overlay, so
-    # unmasked config files are shared between cells regardless (see Runner.run).
-    if jobs > 1 and not getattr(get_adapter(agent), "parallel_safe_config", False):
-        print(f"error: --jobs {jobs} is not supported for {agent}: its CLI configuration "
-              "is not materialized per cell, so concurrent cells share it and corrupt "
-              "each other's results nondeterministically.\n"
-              "  Isolation does not fix this — an isolated home is a symlink overlay, so "
-              "any config file it does not explicitly mask is a symlink to the one real "
-              "file, and a write through one cell is visible to all of them.\n"
-              "  Use --jobs 1 (the default).",
-              file=sys.stderr)
-        return 2
+    # Asked of the runner rather than re-derived, so the operator's message and the guard
+    # that actually refuses cannot drift apart — the condition is a conjunction of adapter
+    # containment support, isolation and a per-spec credential, and two copies of it would
+    # be two chances to disagree about which cell is unsafe. See runner.parallel_unsafe_reason.
+    if jobs > 1:
+        unsafe = parallel_unsafe_reason(agent, get_adapter(agent), isolated, specs)
+        if unsafe:
+            print(f"error: --jobs {jobs} is not supported for this run: {unsafe}.\n"
+                  "  Concurrent cells would corrupt each other's results "
+                  "nondeterministically, in a way that looks like a model problem.\n"
+                  "  Parallelism needs every cell's mutable CLI configuration materialized "
+                  "per cell, which a CONTAINED HOME provides: isolation on, an adapter that "
+                  "supports containment, and a credential in the environment for every "
+                  "cell.\n"
+                  "  Use --jobs 1 (the default) otherwise.",
+                  file=sys.stderr)
+            return 2
     n_eligible = sum(1 for s in specs if s.agents is None or agent in s.agents)
     n_cells = n_eligible * len(targets)
     model_labels = [t.label for t in targets]
@@ -1045,7 +1051,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--agent", help=f"runner to use. Known: {', '.join(adapter_names())}")
     sp.add_argument("--artifacts", default="artifacts", help="artifacts root dir")
     sp.add_argument("--run-id", help="name this run (default: timestamp)")
-    sp.add_argument("--jobs", type=int, default=None, help="parallel cells (default 1)")
+    sp.add_argument("--jobs", type=int, default=None,
+                        help="parallel cells (default 1). Above 1 needs every cell in a "
+                             "contained HOME: isolation on and a credential in the "
+                             "environment, else the run is refused")
     sp.add_argument("--judge-agent", help="agent to grade rubrics (default: claude if installed)")
     sp.add_argument("--judge-model", help="model override for the judge")
     sp.add_argument("--judge-timeout", type=int, default=None,
@@ -1123,6 +1132,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-v", "--verbose", action="store_true")
     sp.set_defaults(func=cmd_selftest)
 
+    sp = sub.add_parser("merge-summaries",
+                        help="combine a fan-out's shard runs into one summary.json/summary.md")
+    sp.add_argument("--run-dir", required=True,
+                    help="the directory the shard run directories sit under; the merged "
+                         "summary is written into it")
+    sp.add_argument("--quiet", action="store_true", help="print nothing on success")
+    sp.set_defaults(func=cmd_merge_summaries)
+
     sp = sub.add_parser("verify-copilot-channels",
                         help="audit an installed copilot build against the MCP "
                              "discovery channels the adapter neutralizes")
@@ -1131,6 +1148,37 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_verify_copilot_channels)
 
     return p
+
+
+def cmd_merge_summaries(args) -> int:
+    """Reassemble one run's artifacts from the shard directories under it.
+
+    For a fan-out: N harness processes each wrote their own run directory, and the sweep they
+    were collectively running has no summary of its own until this writes one. See merge.py
+    for what is copied verbatim and what is recomputed.
+    """
+    run_dir = os.path.abspath(args.run_dir)
+    shards = find_shards(run_dir)
+    if not shards:
+        print(f"error: no shard summaries under {run_dir}.\n"
+              "  A shard directory is an immediate subdirectory holding a summary.json. "
+              "Nothing here has one,\n"
+              "  so either the runs failed before writing any or this is not a fan-out's "
+              "parent directory.",
+              file=sys.stderr)
+        return 2
+
+    try:
+        merged = merge_runs(run_dir, shards)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if not args.quiet:
+        print(f"merged {len(shards)} shard(s) into {os.path.join(run_dir, 'summary.md')}: "
+              f"{merged['n_passed']}/{merged['n_cells']} cells passed "
+              f"({merged['consistency']['comparability']})")
+    return 0
 
 
 def main(argv=None) -> int:

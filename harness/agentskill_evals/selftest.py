@@ -4843,10 +4843,17 @@ def _check_parallel_requires_isolation(failures, verbose):
     believing a private home made concurrency safe; review disproved it, and the arm below
     now proves the sharing directly rather than assuming either way.
 
-    So the property that matters is per-cell MATERIALIZED config (`parallel_safe_config`),
-    which no real adapter can currently claim — `--jobs>1` is therefore refused outright.
-    It was an unenforced invariant before that: DEFAULT_JOBS is 1, so the harness was safe
-    by accident, and `jobs` is a scenario-override key, so YAML could raise it without
+    So the property that matters is per-cell MATERIALIZED config. `parallel_safe_config`
+    declares it per adapter and no adapter claims it; a CONTAINED HOME establishes it per
+    RUN, because `build_isolated_home` with `contained_subpaths` copies instead of
+    wholesale-symlinking and leaves no path resolving out of the cell's own tree. So the
+    guard permits `--jobs>1` exactly when every cell will be contained — isolation on, an
+    adapter that supports containment, and a credential in the environment — and refuses it
+    otherwise. Each of those three is asserted below from the failing direction, because
+    dropping any one of them silently returns the run to sharing one real config.
+
+    It was an unenforced invariant before any of this: DEFAULT_JOBS is 1, so the harness was
+    safe by accident, and `jobs` is a scenario-override key, so YAML could raise it without
     anyone passing a flag.
     """
     import os
@@ -4866,11 +4873,12 @@ def _check_parallel_requires_isolation(failures, verbose):
                                  run_id="par", skills_root=root,
                                  jobs=jobs, isolated=isolated)
 
-    def _run(jobs, isolated):
-        """Empty spec list: run() reaches the guard before it would execute any cell, so
-        this exercises the refusal without launching a CLI."""
+    def _run(jobs, isolated, specs_=()):
+        """run() reaches the guard before it would execute any cell, so this exercises the
+        refusal without launching a CLI. Callers that expect NO refusal pass no specs, so a
+        permitted run has nothing to execute either."""
         try:
-            _mk(jobs, isolated).run([])
+            _mk(jobs, isolated).run(list(specs_))
         except RuntimeError as exc:
             return str(exc)
         return ""
@@ -4894,15 +4902,54 @@ def _check_parallel_requires_isolation(failures, verbose):
     leaked_to_real = "sneaky" in open(
         os.path.join(shared_home, ".codex", "config.toml")).read()
 
+    # A real spec list, not []: the credential arm is per-cell, so an empty run is vacuously
+    # safe and would assert nothing. run() still reaches the guard before executing any of
+    # them, so no CLI is launched.
+    specs = [EvalSpec(name="demo", prompt="hi"), EvalSpec(name="demo2", prompt="hi")]
+    token = "CLAUDE_CODE_OAUTH_TOKEN"
+    saved = os.environ.pop(token, None)
+    claude = get_adapter("claude")
+
+    def _reason(isolated, specs_=None):
+        return runner_mod.parallel_unsafe_reason(
+            "claude", claude, isolated, specs if specs_ is None else specs_) or ""
+
     try:
-        refused_isolated = _run(4, True)
-        refused_unisolated = _run(4, False)
-        # Serial must keep working in BOTH modes: --jobs 1 is the default and the whole
-        # workaround, and non-isolated serial is a documented opt-out. A guard that broke
-        # either would be worse than the hole it closes.
+        # 1) No credential anywhere: nothing switches the cells to a contained home, so an
+        #    isolated parallel run is still a shared-config run and is refused.
+        refused_no_cred = _run(4, True, specs)
+        reason_no_cred = _reason(True)
+
+        # 2) Credential present for every cell -> every cell contained -> permitted. Checked
+        #    through the predicate rather than run(), which would go on to spend the cells.
+        os.environ[token] = "sk-test"
+        allowed_contained = _reason(True)
+        # ...but isolation off still shares the real home, token or no token.
+        refused_unisolated = _run(4, False, specs)
+        # ...and one cell that blanks the variable refuses the whole run: that cell alone
+        # would fall back to the symlink overlay every other cell also reaches through.
+        one_blanked = [specs[0], EvalSpec(name="blank", prompt="hi", env={token: ""})]
+        reason_one_blanked = _reason(True, one_blanked)
+
+        # 3) An adapter with no containment surface at all is refused even fully credentialed.
+        class _Uncontainable:
+            parallel_safe_config = False
+            contained_home_subpaths = None
+            credential_env_vars = [token]
+
+        reason_uncontainable = runner_mod.parallel_unsafe_reason(
+            "claude", _Uncontainable(), True, specs) or ""
+
+        # Serial must keep working in BOTH modes and with no credential at all: --jobs 1 is
+        # the default and the whole workaround, and non-isolated serial is a documented
+        # opt-out. A guard that broke either would be worse than the hole it closes.
+        del os.environ[token]
         serial_isolated = _run(1, True)
         serial_unisolated = _run(1, False)
     finally:
+        os.environ.pop(token, None)
+        if saved is not None:
+            os.environ[token] = saved
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(shared_home, ignore_errors=True)
 
@@ -4915,14 +4962,182 @@ def _check_parallel_requires_isolation(failures, verbose):
            f"gated on isolation instead of on the adapter", failures, verbose)
 
     _check("runner.parallel_refused_until_config_is_materialized",
-           "refusing to run 4 cells in parallel" in refused_isolated
-           and "--jobs 1" in refused_isolated
-           and "parallel_safe_config" in refused_isolated
+           "refusing to run 4 cells in parallel" in refused_no_cred
+           and "--jobs 1" in refused_no_cred
+           and "CONTAINED HOME" in refused_no_cred
+           and "no credential is set" in reason_no_cred
+           and token in reason_no_cred
            and refused_unisolated != ""
+           and "isolation is off" in refused_unisolated
+           and "does not support a contained HOME" in reason_uncontainable
+           and reason_one_blanked != ""
            and serial_isolated == "" and serial_unisolated == "",
-           "--jobs>1 is refused for a runner whose config is not materialized per cell — "
-           "ISOLATED included, since isolation does not stop the sharing — and the message "
-           "names what would lift it. Both serial modes still run",
+           "--jobs>1 is refused whenever any cell would fall back to the symlink-overlay "
+           "home — no credential, isolation off, an adapter with no containment surface, or "
+           "one cell that blanks the variable — and the message names what would lift it. "
+           "Both serial modes still run",
+           failures, verbose)
+
+    _check("runner.parallel_allowed_when_every_cell_is_contained",
+           allowed_contained == "",
+           "with isolation on, an adapter that supports a contained HOME and the credential "
+           "set for every cell, each cell's HOME is a private copy with no symlink out — the "
+           "same per-cell materialized config `parallel_safe_config` names — so --jobs>1 is "
+           "permitted rather than refused on the adapter's blanket default",
+           failures, verbose)
+
+
+def _check_merge_shard_summaries(failures, verbose):
+    """A fan-out's shard runs reassemble into artifacts that read like a single run's.
+
+    The load-bearing arm is the consistency one, and it is the reason this is a merge of
+    SPREADS rather than a conjunction of verdicts. Two shards can each be internally uniform
+    — each reports `verified` over its own cells — and still disagree with each other about
+    the CLI version. `all(verified)` says verified; the axis re-spread across both says
+    drift. A fan-out starts N CLIs at once, which is exactly when a straddled auto-update is
+    most likely, so the cheap answer is wrong precisely where it matters most.
+
+    The rest is about the table. Rows are copied verbatim and are POSITIONAL against the
+    header their own shard wrote, so shards that are not columns of one matrix cannot be
+    concatenated — the result would mislabel a model's results rather than fail, and every
+    number read out of it afterwards would be wrong about who earned it. Refused, and the
+    refusal is asserted here because it is the failure that does not announce itself.
+    """
+    import json
+    import os
+    import shutil
+    import tempfile as _tempfile
+
+    from .merge import merge_runs
+    from .runner import merge_consistency
+
+    print("merge shard summaries:")
+
+    root = _tempfile.mkdtemp(prefix="ase-merge-")
+
+    def _consistency(version):
+        """A shard's own block, in the shape `_consistency` publishes: one known CLI
+        version, no MCP servers, nothing unknown — i.e. internally `verified`."""
+        return {"comparability": "verified", "drift": [], "cli_versions": [version],
+                "cli_version_unknown_cells": 0, "cli_version_verified": True,
+                "mcp_server_sets": [[]], "mcp_server_set_unknown_cells": 0,
+                "mcp_server_states": [[]], "mcp_server_health_unknown_cells": 0,
+                "mcp_server_set_verified": True, "mcp_server_health_verified": True,
+                "isolation_uniform": True}
+
+    def _shard(name, eval_name, passed, version="1.0.0", targets=None, ungraded=False):
+        directory = os.path.join(root, name)
+        os.makedirs(directory)
+        targets = targets if targets is not None else [{"model": "m1", "reasoning_effort": None}]
+        summary = {
+            "run_id": name, "consistency": _consistency(version),
+            "command": f"run --evals {eval_name}.yaml --agent claude", "agent": "claude",
+            "models": [t["model"] for t in targets], "targets": targets,
+            "isolated": True, "isolation_requested": True, "all_cells_isolated": True,
+            "n_evals": 1, "n_cells": 1, "n_passed": 1 if passed else 0,
+            "judge_agent": "claude", "judge_model": "m1",
+            "cells": [{"agent": "claude", "model": targets[0]["model"],
+                       "reasoning_effort": None, "eval": eval_name, "skill": "s",
+                       "isolated": True, "cli_version": version, "ungraded": ungraded,
+                       "passed": passed, "n_pass": 1, "n_total": 1,
+                       "artifacts": f"m1/s/{eval_name}"}],
+        }
+        with open(os.path.join(directory, "summary.json"), "w", encoding="utf-8") as fh:
+            json.dump(summary, fh)
+        mark = "\u2705" if passed else "\u274c"
+        with open(os.path.join(directory, "summary.md"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "# Eval results \u2014 claude\n\n"
+                "| eval | m1 |\n|---|---|\n"
+                f"| {eval_name} | [{mark} det 1/1](m1/s/{eval_name}/report.md) |\n\n"
+                "## Pass rate\n\n| model | pass rate |\n|---|---|\n| m1 | "
+                f"{1 if passed else 0}/1 |\n")
+        return directory
+
+    try:
+        _shard("shard-01of02", "01-alpha", True)
+        _shard("shard-02of02", "02-beta", False)
+        merged = merge_runs(root)
+        markdown = open(os.path.join(root, "summary.md"), encoding="utf-8").read()
+        written = json.load(open(os.path.join(root, "summary.json"), encoding="utf-8"))
+
+        # Same axes, one value each -> still verified. The negative arm below is what gives
+        # this one meaning: without it, a merge that hard-coded "verified" would pass here.
+        uniform = merge_consistency([_consistency("1.0.0"), _consistency("1.0.0")])
+        straddled = merge_consistency([_consistency("1.0.0"), _consistency("1.0.1")])
+        conjunction_would_say = all(
+            b["comparability"] == "verified" for b in
+            (_consistency("1.0.0"), _consistency("1.0.1")))
+
+        # Columns that do not line up, refused rather than concatenated.
+        other = _tempfile.mkdtemp(prefix="ase-merge-cols-")
+        try:
+            root2 = other
+            os.makedirs(os.path.join(root2, "shard-01of02"))
+            shutil.copy(os.path.join(root, "shard-01of02", "summary.json"),
+                        os.path.join(root2, "shard-01of02", "summary.json"))
+            shutil.copy(os.path.join(root, "shard-01of02", "summary.md"),
+                        os.path.join(root2, "shard-01of02", "summary.md"))
+            saved_root, root = root, root2
+            _shard("shard-02of02", "02-beta", False,
+                   targets=[{"model": "m1", "reasoning_effort": None},
+                            {"model": "m2", "reasoning_effort": None}])
+            root = saved_root
+            try:
+                merge_runs(root2)
+                refused_columns = ""
+            except ValueError as exc:
+                refused_columns = str(exc)
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    _check("merge.consistency_is_rejudged_across_shards",
+           uniform["comparability"] == "verified"
+           and straddled["comparability"] == "drift"
+           and any("CLI version varied" in d for d in straddled["drift"])
+           and straddled["cli_versions"] == ["1.0.0", "1.0.1"]
+           and conjunction_would_say,
+           "two shards that were each internally `verified` at DIFFERENT CLI versions merge "
+           "to `drift`, not to `verified` \u2014 the axis is re-spread across the union and "
+           "re-judged rather than the verdicts being and-ed together, which is what the "
+           "conjunction of their own verdicts would have said (and it does: "
+           f"{conjunction_would_say})", failures, verbose)
+
+    _check("merge.counts_are_over_every_shards_cells",
+           merged["n_cells"] == 2 and merged["n_passed"] == 1 and merged["n_evals"] == 2
+           and written["n_cells"] == 2
+           and [c["eval"] for c in merged["cells"]] == ["01-alpha", "02-beta"]
+           and [s["run_id"] for s in merged["shards"]] == ["shard-01of02", "shard-02of02"],
+           "the merged summary counts every shard's cells, and records which shard it drew "
+           "them from so a reader can get back to the run that produced any one of them",
+           failures, verbose)
+
+    _check("merge.links_point_into_the_shard_that_produced_the_cell",
+           "](shard-01of02/m1/s/01-alpha/report.md)" in markdown
+           and "](shard-02of02/m1/s/02-beta/report.md)" in markdown
+           and merged["cells"][0]["artifacts"] == "shard-01of02/m1/s/01-alpha"
+           and "det 1/1" in markdown,
+           "every report link is repointed at the shard subdirectory it now sits under \u2014 "
+           "a link left relative to the shard's own run directory resolves to nothing from "
+           "the parent, which is worse than no link because it looks like one. The cell TEXT "
+           "around it is carried through verbatim rather than regenerated",
+           failures, verbose)
+
+    _check("merge.pass_rate_is_recomputed_not_copied",
+           "| m1 | 1/2 |" in markdown,
+           "the pass-rate table is derived from the merged cells, not carried over from a "
+           "shard \u2014 each shard's own table says 1/1 or 0/1 and neither is the run's rate",
+           failures, verbose)
+
+    _check("merge.mismatched_columns_are_refused",
+           "different model targets" in refused_columns
+           and "shard-02of02" in refused_columns,
+           "shards whose tables have different columns are refused by name. Rows are copied "
+           "verbatim and are positional against their own shard's header, so concatenating "
+           "them would file one model's result under another's heading \u2014 silently, and "
+           "every number read out of the table afterwards would be wrong",
            failures, verbose)
 
 
@@ -9525,6 +9740,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _section(_check_unreadable_version_adapters, failures, verbose)
     _section(_check_matrix_consistency, failures, verbose)
     _section(_check_parallel_requires_isolation, failures, verbose)
+    _section(_check_merge_shard_summaries, failures, verbose)
     _section(_check_codex_post_run_mcp_recheck, failures, verbose)
 
     # declared MCP servers: schema, secrets, injection, refusals

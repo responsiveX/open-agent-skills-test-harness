@@ -22,7 +22,7 @@ JUDGE_MAX_FILES = 60
 # so keep the file cap above what a realistic multi-project workspace produces, and let a
 # long file truncate (below) rather than vanish. Both losses are now announced in-band.
 JUDGE_MAX_INLINE_FILES = 20
-JUDGE_MAX_INLINE_BYTES = 4000
+JUDGE_MAX_INLINE_BYTES = 10000
 # The report inlines every text file, but per-file only up to this many bytes (with a
 # truncation note) — a run that legitimately produces a multi-MB CSV/JSON export must not
 # balloon report.md; the full file is still in workspace/.
