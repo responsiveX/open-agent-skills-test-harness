@@ -56,6 +56,11 @@ _TEXT_EXT = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".cfg",
 # (".editorconfig", "") — a leading dot is not an extension — so a dotfile can never be
 # recognized by _TEXT_EXT no matter what is put in it. Matched case-insensitively on the
 # basename instead. Without this an `.editorconfig`-focused eval grades against nothing.
+# `.env` and `.npmrc` belong here even though they conventionally hold secrets: inside the
+# workspace they are the model's own output and an eval that asks for one has to be gradable.
+# What keeps a HOST `.env` out of the judge prompt is `is_secret_name` below, applied in
+# `inline_files` to outside-the-workspace paths only — do not re-fix it by deleting them here,
+# which would blind the judge to work it must grade and still inline `~/.codex/auth.json`.
 _TEXT_NAMES = {".editorconfig", ".gitignore", ".gitattributes", ".dockerignore",
                ".env", ".npmrc", ".nvmrc", ".prettierrc", ".eslintrc", ".babelrc",
                "dockerfile", "makefile", "readme", "license", "notice", "codeowners"}
@@ -68,6 +73,41 @@ def _is_text(path: str) -> bool:
     if base in _TEXT_NAMES:
         return True
     return os.path.splitext(base)[1] in _TEXT_EXT
+
+
+# Names that conventionally hold a credential. The single place that decides what
+# "credential-bearing" means, so a newly-learned way a file can hold a secret joins the
+# reasons already here rather than becoming a second check one caller consults.
+#
+# Several of these are ALSO in _TEXT_NAMES / _TEXT_EXT — `.env` and `.npmrc` are there
+# deliberately, because an eval whose task is to write one must be gradable — so this is
+# not an exclusion from inlining, only from inlining a file the harness reached OUTSIDE
+# the workspace (see `inline_files`).
+_SECRET_NAMES = {".npmrc", ".netrc", "_netrc", ".pypirc", ".pgpass", ".my.cnf",
+                 ".htpasswd", ".dockercfg", ".git-credentials", ".gitconfig",
+                 "credentials", "credentials.json", "auth.json", "token.json",
+                 "secrets.json", "secrets.yaml", "secrets.yml",
+                 "hosts.yml", "hosts.yaml",
+                 "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+# Matched as a PREFIX so the whole `.env` family is covered — `.env.local`,
+# `.env.production`, `.envrc` — not just the bare name the reproduction happened to use.
+_SECRET_PREFIXES = (".env",)
+# Key/certificate material. None of these is in _TEXT_EXT today, so none would be inlined
+# anyway; they are listed because this predicate must stay right on its own terms rather
+# than by depending on a list it does not control.
+_SECRET_EXT = {".pem", ".key", ".pfx", ".p12", ".jks", ".keystore", ".asc", ".gpg"}
+
+
+def is_secret_name(path: str) -> bool:
+    """True if this file's NAME marks it as a conventional credential store.
+
+    A name test, not a content test: it says what the file is for, which is the only thing
+    knowable without reading — and reading it into a decision is the disclosure being
+    avoided."""
+    base = os.path.basename(path).lower()
+    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):
+        return True
+    return os.path.splitext(base)[1] in _SECRET_EXT
 
 
 # Provisioned skills are inputs, not model output; .git/node_modules/etc. are noise.
@@ -287,21 +327,47 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
     cosmetic one: the judge grades with tools disabled, so a file dropped without a word is
     indistinguishable to it from a file the run never produced — and it fails the rubric item
     for a file that is sitting in workspace/. The count is what carries that, so it stays
-    exact however many names the cap withholds."""
+    exact however many names the cap withholds.
+
+    One class of file is withheld for a reason that is not a budget: a path OUTSIDE the
+    workspace whose name marks it a credential store (`is_secret_name`). Those are counted and
+    named in their own trailing note, never inlined. See the loop for why the rule is scoped to
+    outside-the-workspace rather than to the name alone."""
     seeded_set = set(seeded or ())
     chunks: list[str] = []
     used = 0
     over_cap: list[str] = []     # text files the file-count budget had no room for
     over_bytes: list[str] = []   # text files skipped whole for exceeding max_bytes
+    secret: list[str] = []       # outside files whose NAME marks them a credential store
 
-    def _candidates() -> Iterator[tuple[str, str]]:
+    def _candidates() -> Iterator[tuple[str, str, bool]]:
         for ap, rel in _iter_files(workdir):
             yield ap, (f"{rel}  [seeded input, not model output]"
-                       if rel in seeded_set else rel)
+                       if rel in seeded_set else rel), False
         for ap in extra:
-            yield ap, f"{ap}  [outside workspace]"
+            yield ap, f"{ap}  [outside workspace]", True
 
-    for path, label in _candidates():
+    for path, label, outside in _candidates():
+        # An `extra` path is here because the run NAMED it in a tool call, and
+        # `writes_outside_workspace()` is computed from `file_paths_touched()`, which counts a
+        # READ as much as a write. So a run that merely opened `~/.npmrc` would otherwise have
+        # that file's auth token copied verbatim into the judge prompt (a third-party model)
+        # and into report.md (durable, and routinely pasted into an issue) — a disclosure the
+        # run never asked for and the operator never saw. Nothing outside the workspace is this
+        # run's output, so withholding it costs the judge no evidence it is owed: the PATH is
+        # still named here and in the tree, and the path is what the isolation verdict needs.
+        #
+        # Scoped to `outside`, not to the name alone, because inside the workspace the opposite
+        # holds — a `.env` there IS the model's own work (that is why `.env` is in _TEXT_NAMES),
+        # and an eval that asks for one must stay gradable.
+        #
+        # This bounds the ACCIDENTAL disclosure: the incidental read of a well-known credential
+        # store. Being a name denylist it cannot bound a run that sets out to exfiltrate — such
+        # a run can put any bytes it likes in its final message, which the judge sees regardless
+        # of anything decided here.
+        if outside and is_secret_name(path):
+            secret.append(label)
+            continue
         if not _is_text(path):
             continue          # binary: contents skipped, but file_tree still lists it
         try:
@@ -349,4 +415,17 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
                       + _named_lines(over_bytes, JUDGE_MAX_NAMED_FILES)
                       + "\nTheir contents are absent from this view — do not read that as "
                         "the files being absent or empty.")
+    # Announced for the same reason the two notes above are: a file dropped without a word
+    # is indistinguishable, to a judge grading with tools disabled, from a file the run
+    # never produced. Unlike them this note does not imply a budget was in force, so its
+    # enumeration is capped on the rule the TREE uses rather than theirs — every name in the
+    # uncapped (report) view, JUDGE_MAX_NAMED_FILES in the judge's. The count stays exact.
+    if secret:
+        chunks.append(f"--- CONTENTS WITHHELD: {len(secret)} file(s) outside the workspace "
+                      "whose name marks them a credential store ---\n"
+                      + _named_lines(secret,
+                                     None if max_files is None else JUDGE_MAX_NAMED_FILES)
+                      + "\nThe run touched these paths. Their contents are host machine "
+                        "state, not this run's output, and are deliberately not reproduced "
+                        "here or in the report — grade the path, not the contents.")
     return "\n\n".join(chunks)

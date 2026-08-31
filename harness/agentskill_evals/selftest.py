@@ -6344,6 +6344,122 @@ def _check_inline_text_kinds(failures, verbose):
         shutil.rmtree(ws, ignore_errors=True)
 
 
+def _check_inline_secret_files(failures, verbose):
+    """A credential-bearing file the run reached OUTSIDE the workspace must never have its
+    CONTENTS inlined — not into the judge prompt (which is sent to a third-party model) nor
+    into report.md (which is durable and gets pasted into issues).
+
+    The path that makes this reachable: `writes_outside_workspace()` is computed from
+    `file_paths_touched()`, which counts a READ as much as a write, so an agent that merely
+    opened the operator's `~/.npmrc` handed the harness that file to publish. `.env` and
+    `.npmrc` are only the visible instances — `auth.json` is a codex credential store and
+    `.json` has always been inlinable, so a fix that stopped at the two reported names would
+    have left the class open.
+
+    Scope is asserted in both directions, because a rule that withheld everything would pass
+    every leak arm here while destroying two things the module exists to do: inline the model's
+    own `.env`, and show an artifact the run wrote outside the workspace."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import inline_files, is_secret_name
+
+    print("outside-workspace secrets:")
+
+    # The predicate on its own, on the cases that distinguish it from "the reported names".
+    for name, want, why in (
+        (".env", True, "the reported name"),
+        (".env.local", True, "the .env FAMILY, not just the bare name"),
+        (".envrc", True, "direnv, which holds the same thing"),
+        (".npmrc", True, "the other reported name"),
+        (".NPMRC", True, "matched case-insensitively"),
+        ("auth.json", True, "a codex credential store, and .json inlines"),
+        ("hosts.yml", True, "a gh credential store, and .yml inlines"),
+        ("id_ed25519", True, "a private key"),
+        ("server.pem", True, "key material by extension"),
+        ("README.md", False, "an ordinary file is NOT swept up"),
+        ("environment.yml", False, "...nor is one that merely starts like one"),
+    ):
+        _check(f"secrets.name_{name.lower().strip('.')}",
+               is_secret_name(os.path.join("some", "dir", name)) is want,
+               f"is_secret_name({name}) is {want} - {why}", failures, verbose)
+
+    ws = tempfile.mkdtemp(prefix="ase-secret-ws-")
+    outside = tempfile.mkdtemp(prefix="ase-secret-out-")
+    try:
+        # In the workspace: the model's own output. Must still be graded.
+        with open(os.path.join(ws, ".env"), "w") as fh:
+            fh.write("DATABASE_URL=postgres://localhost/app_MINE")
+
+        # Outside: the operator's machine. Distinct marker per file so no arm can pass on
+        # another arm's evidence.
+        host = {".env": "AWS_SECRET_ACCESS_KEY=LEAK_HOSTENV",
+                ".npmrc": "//registry.npmjs.org/:_authToken=LEAK_NPMTOKEN",
+                ".env.local": "STRIPE_KEY=LEAK_ENVLOCAL",
+                "auth.json": '{"tokens": {"access_token": "LEAK_AUTHJSON"}}',
+                "report.md": "# LEAK_NOTASECRET\n\nthe artifact the run really wrote"}
+        extra = []
+        for name, body in host.items():
+            ap = os.path.join(outside, name)
+            with open(ap, "w") as fh:
+                fh.write(body)
+            extra.append(ap)
+
+        for view, kwargs in (("judge", {"max_files": 20, "max_bytes": 4000, "truncate": True}),
+                             ("report", {"max_bytes": 200000, "truncate": True})):
+            out = inline_files(ws, extra, **kwargs)
+
+            # A positive fact FIRST: an empty string passes every "LEAK not in out" check
+            # below, and so does a run of inline_files that never looked at a file at all.
+            _check(f"secrets.{view}.view_is_not_empty",
+                   "--- " in out and "CONTENTS WITHHELD:" in out,
+                   f"the view has content and states the withholding: {out[:80]!r}",
+                   failures, verbose)
+
+            # LEAK_ENVLOCAL is the one marker guarded by two facts at once: `.env.local` is
+            # also not in _TEXT_EXT/_TEXT_NAMES, so it would not inline even unguarded. Kept
+            # because that is a property of a list this rule does not own, and the arm that
+            # actually discriminates for the .env FAMILY is path_still_named_env_local below
+            # (unguarded, the file is dropped with no note at all).
+            for marker in ("LEAK_HOSTENV", "LEAK_NPMTOKEN", "LEAK_ENVLOCAL", "LEAK_AUTHJSON"):
+                _check(f"secrets.{view}.body_withheld_{marker.lower()}",
+                       marker not in out,
+                       f"{marker} never reaches the {view} view", failures, verbose)
+
+            # Withheld is not vanished: the judge must be able to tell a file it cannot see
+            # from a file that was never there, and the isolation verdict is read off paths.
+            for name in (".env", ".npmrc", ".env.local", "auth.json"):
+                _check(f"secrets.{view}.path_still_named_{name.strip('.').replace('.', '_')}",
+                       os.path.join(outside, name) in out,
+                       f"the {name} PATH is still named in the {view} view", failures, verbose)
+
+            _check(f"secrets.{view}.count_is_exact",
+                   "CONTENTS WITHHELD: 4 file(s)" in out,
+                   f"the note counts every withheld file: {out[-400:]!r}", failures, verbose)
+
+            # The other direction, twice: neither the outside artifact the module exists to
+            # surface nor the model's own .env may be caught by this rule.
+            _check(f"secrets.{view}.outside_nonsecret_still_inlined",
+                   "LEAK_NOTASECRET" in out,
+                   f"an ordinary file written outside the workspace still inlines ({view})",
+                   failures, verbose)
+            _check(f"secrets.{view}.workspace_env_still_inlined",
+                   "app_MINE" in out,
+                   f"the model's OWN .env is still graded ({view})", failures, verbose)
+
+        # Negative control on the note itself: it must be absent when nothing was withheld,
+        # or "the note is present" above proves nothing about the withholding.
+        clean = inline_files(ws)
+        _check("secrets.no_note_without_secrets",
+               "CONTENTS WITHHELD" not in clean and "app_MINE" in clean,
+               f"a run that touched nothing outside gets no withholding note: {clean!r}",
+               failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
 def _check_inline_file_cap_announced(failures, verbose):
     """Hitting the file-count cap must be announced. file_tree already prints a truncation
     line; inline_files stopped silently, so a partially-graded case looked byte-identical to a
@@ -9417,6 +9533,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     # report inlining is capped per file; the judge's skip behavior is unchanged
     _section(_check_inline_truncation, failures, verbose)
     _section(_check_inline_text_kinds, failures, verbose)
+    _section(_check_inline_secret_files, failures, verbose)
     _section(_check_inline_file_cap_announced, failures, verbose)
     _section(_check_view_name_lists_bounded, failures, verbose)
 

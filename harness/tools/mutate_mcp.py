@@ -2881,6 +2881,49 @@ MUTATIONS = [
      "            JUDGE_MAX_NAMED_FILES))",
      "names.tree_report_lists_all"),
 
+    # ---- host credentials must not be inlined into the judge prompt or the report ---------
+    # `writes_outside_workspace()` is computed from `file_paths_touched()`, which counts a READ
+    # as much as a write, so a run that merely opened the operator's `~/.npmrc` handed the
+    # harness that file to publish — into a prompt sent to a third-party model, and into a
+    # report.md that outlives the run.
+    ("M366-a-host-credential-file-is-inlined-anyway", WSVIEW,
+     "        if outside and is_secret_name(path):",
+     "        if False and is_secret_name(path):",
+     "secrets.judge.body_withheld_leak_npmtoken"),
+    # The dual, and the reason the rule is scoped to OUTSIDE rather than to the name: a `.env`
+    # under the workspace is the model's own output, and an eval whose task is to write one
+    # has to stay gradable. A name-only rule passes every leak arm above and blinds the judge.
+    ("M367-the-name-rule-also-swallows-the-models-own-output", WSVIEW,
+     "        if outside and is_secret_name(path):",
+     "        if is_secret_name(path):",
+     "secrets.judge.workspace_env_still_inlined"),
+    # Withheld is not vanished. The judge grades with tools disabled, so a file dropped without
+    # a word is indistinguishable from one the run never touched — and the isolation verdict is
+    # read off exactly these paths.
+    ("M368-the-withheld-file-is-dropped-without-a-word", WSVIEW,
+     "            secret.append(label)\n            continue",
+     "            continue",
+     "secrets.judge.path_still_named_npmrc"),
+    # Deny-everything scores full marks on every arm above: it withholds the leak markers by
+    # withholding everything, including the outside artifact the view exists to surface.
+    ("M369-every-outside-file-is-treated-as-a-credential", WSVIEW,
+     ("    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):\n"
+      "        return True\n"
+      "    return os.path.splitext(base)[1] in _SECRET_EXT"),
+     "    return True",
+     "secrets.judge.outside_nonsecret_still_inlined"),
+    # The rule is wider than the two names it was reported for, in both directions it was
+    # widened: the `.env` FAMILY by prefix...
+    ("M370-only-the-exact-names-count-not-the-env-family", WSVIEW,
+     "    if base in _SECRET_NAMES or base.startswith(_SECRET_PREFIXES):",
+     "    if base in _SECRET_NAMES:",
+     "secrets.name_env"),
+    # ...and key material by extension, which no name list can enumerate.
+    ("M371-key-material-is-not-recognized-by-extension", WSVIEW,
+     "    return os.path.splitext(base)[1] in _SECRET_EXT",
+     "    return False",
+     "secrets.name_server.pem"),
+
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
      "        if path == PATH_STREAMABLE and not self._version_ok():\n            return 400",
