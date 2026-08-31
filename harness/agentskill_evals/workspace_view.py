@@ -284,10 +284,17 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
             over_cap.append(label)
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                body = fh.read(max_bytes) if max_bytes is not None else fh.read()
+            with open(path, "rb") as fh:
+                raw = fh.read(max_bytes) if max_bytes is not None else fh.read()
         except OSError:
             continue
+        # Read bytes and decode here rather than reading text with a cap: `max_bytes` is a
+        # BYTE budget — it is compared against os.path.getsize() above and reported as bytes
+        # in the note below — but a text-mode read(n) caps CHARACTERS, so any non-ASCII file
+        # would overrun the cap (up to 4x on UTF-8) and the note would misstate what was kept.
+        # errors="replace" also absorbs the codepoint the byte-exact cut may have split.
+        body = raw.decode("utf-8", errors="replace")
+        body = body.replace("\r\n", "\n").replace("\r", "\n")  # as text mode did
         if max_bytes is not None and size > max_bytes:
             body += (f"\n… [truncated at {max_bytes} bytes of {size} — "
                      "full file in workspace/]")

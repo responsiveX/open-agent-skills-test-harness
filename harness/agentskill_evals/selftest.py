@@ -6222,6 +6222,17 @@ def _check_exec_process_tree_handles(failures, verbose):
         exec_mod._win32_kernel32 = saved_k32
 
 
+def _inlined_body(out: str, name: str) -> str:
+    """The body inline_files emitted for `name`, without its header or truncation note.
+    Returns "" when the file is absent from the view, so a check on the body cannot pass
+    by finding nothing."""
+    marker = f"--- {name} ---\n"
+    if marker not in out:
+        return ""
+    body = out.split(marker, 1)[1].split("\n\n--- ", 1)[0]
+    return body.split("\n\u2026 [truncated at", 1)[0]
+
+
 def _check_inline_truncation(failures, verbose):
     """The report inlines every text file but must cap each one: a legitimate multi-MB CSV
     export would otherwise land verbatim in report.md. truncate=True (report) inlines up to
@@ -6256,6 +6267,28 @@ def _check_inline_truncation(failures, verbose):
                "NOT INLINED" in out_skip and "big.csv" in out_skip,
                f"a skipped oversize file is named, not silently dropped: {out_skip!r}",
                failures, verbose)
+        # A cap labelled in bytes must be enforced in BYTES. A text-mode read(n) caps
+        # CHARACTERS, so an all-ASCII fixture (big.csv above) passes either way and
+        # exercises only the path where the bug cannot appear. U+00E9 is 2 bytes per
+        # character: reading 10 CHARACTERS of it yields 20 bytes, twice the promised cap,
+        # and the "truncated at 10 bytes" note would then misstate what was kept.
+        u8 = os.path.join(ws, "utf8.txt")
+        with open(u8, "w", encoding="utf-8") as fh:
+            fh.write("é" * 40)            # 40 characters, 80 bytes
+        kept = _inlined_body(inline_files(ws, max_bytes=10, truncate=True), "utf8.txt")
+        _check("inline.byte_cap_counts_bytes",
+               kept == "é" * 5 and len(kept.encode("utf-8")) == 10,
+               f"a 10-BYTE cap keeps 5 two-byte characters, not 10 of them: {kept!r}",
+               failures, verbose)
+        # An odd cap lands mid-codepoint: errors="replace" must absorb the split half
+        # rather than raising, and must not smuggle it through as anything else.
+        kept9 = _inlined_body(inline_files(ws, max_bytes=9, truncate=True), "utf8.txt")
+        _check("inline.byte_cap_split_codepoint",
+               kept9 == "é" * 4 + "�",
+               f"a cap landing mid-codepoint decodes to a replacement char: {kept9!r}",
+               failures, verbose)
+        os.remove(u8)
+
         out_full = inline_files(ws)
         _check("inline.uncapped_full", "x" * 100 in out_full,
                "no cap inlines the whole file", failures, verbose)

@@ -160,6 +160,9 @@ PROXY_VERIFIER = "tools/verify_mcp_proxy.py"
 # readers below from a different program. See `_classify` for where the line falls: what §E17
 # drives is fair game, and this runner's own scoring is not.
 SELF = "tools/mutate_mcp.py"
+# The workspace view the report and the judge are both built from. Production like any
+# other target, and reachable from the selftest, so the path routes it there.
+WSVIEW = "agentskill_evals/workspace_view.py"
 
 MUTATIONS = [
     ("M1-witness-fails-any-server", CLAUDE,
@@ -2834,6 +2837,22 @@ MUTATIONS = [
      "        if not s.is_stdio:\n            raise RuntimeError(",
      "        if False:\n            raise RuntimeError(",
      "mcp.the_proxy_config_writer_refuses_what_it_cannot_proxy"),
+
+    # ---- the inline view's byte budget ----------------------------------------------------
+    # `max_bytes` is compared against `os.path.getsize` and printed as a byte count, so it is
+    # a BYTE budget; a text-mode `read(n)` caps CHARACTERS and overruns it by up to 4x on
+    # UTF-8, with the truncation note misstating what was kept. The arm's fixture is non-ASCII
+    # for exactly this reason — the ASCII one beside it passes under either read.
+    ("M360-the-byte-budget-counts-characters", WSVIEW,
+     '            with open(path, "rb") as fh:\n                raw = fh.read(max_bytes) if max_bytes is not None else fh.read()',
+     '            with open(path, encoding="utf-8", errors="replace") as fh:\n                raw = (fh.read(max_bytes) if max_bytes is not None else fh.read()).encode("utf-8")',
+     "inline.byte_cap_counts_bytes"),
+    # A byte-exact cut can land mid-codepoint. Dropping the half silently reads as a clean
+    # truncation, so the judge cannot tell a cut file from a file that ended there.
+    ("M361-the-split-codepoint-is-dropped-not-marked", WSVIEW,
+     '        body = raw.decode("utf-8", errors="replace")',
+     '        body = raw.decode("utf-8", errors="ignore")',
+     "inline.byte_cap_split_codepoint"),
 
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
