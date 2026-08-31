@@ -6372,6 +6372,101 @@ def _check_inline_file_cap_announced(failures, verbose):
         shutil.rmtree(ws, ignore_errors=True)
 
 
+def _check_view_name_lists_bounded(failures, verbose):
+    """The names of files a budget WITHHELD are unbounded content in a view whose whole point
+    is a bounded prompt: a workspace with thousands of text files put every one of their names
+    into the judge prompt, spending more than inlining them would have. The COUNT is what the
+    note has to carry (a judge that knows evidence is missing does not mark the file absent),
+    so the count stays exact and only the enumeration is cut — and the cut says how much it
+    cut, or the reader silently reads a truncated list as the whole of it.
+
+    Three lists, one rule: over-the-file-cap, over-the-byte-cap, and the tree's
+    written-OUTSIDE-the-workspace paths, which are bounded only by what the run touched."""
+    import os
+    import shutil
+    import tempfile
+
+    from .workspace_view import JUDGE_MAX_NAMED_FILES as CAP
+    from .workspace_view import file_tree, inline_files
+
+    def _listed(block: str, ext: str) -> int:
+        """How many filenames the note actually enumerates — counted from the rendered text,
+        not from what the code believed it wrote."""
+        return sum(1 for ln in block.splitlines()
+                   if ln.startswith("  ") and ln.strip().split("  ")[0].endswith(ext))
+
+    print("view name-list bounds:")
+    n = CAP + 12          # enough over the cap that an off-by-one cannot pass this by luck
+    ws = tempfile.mkdtemp(prefix="ase-names-")
+    try:
+        for i in range(n + 3):
+            with open(os.path.join(ws, f"N{i:03d}.cs"), "w") as fh:
+                fh.write("x" * 50)
+
+        over = inline_files(ws, max_files=3)
+        withheld = n + 3 - 3
+        _check("names.cap_total_is_exact", f"{withheld} more text file(s)" in over,
+               f"the header still counts every withheld file: {over[:120]!r}",
+               failures, verbose)
+        _check("names.cap_list_is_bounded", _listed(over, ".cs") == CAP,
+               f"the enumeration is cut to the cap, not {_listed(over, '.cs')} names",
+               failures, verbose)
+        _check("names.cap_elision_counted",
+               f"(+ {withheld - CAP} more" in over,
+               f"the cut says how many names it dropped: {over[-200:]!r}", failures, verbose)
+        # The negative control the two checks above cannot give: a name PAST the cap must be
+        # gone. Without it, an implementation that listed everything and appended an elision
+        # line would score full marks.
+        _check("names.cap_last_name_omitted", f"N{n + 2:03d}.cs" not in over,
+               "a name past the cap is really absent from the prompt", failures, verbose)
+        _check("names.cap_first_name_kept", "N003.cs" in over,
+               "...while the names inside the cap are still there", failures, verbose)
+
+        # Same rule, the byte-budget list (truncate=False), which is a different code path.
+        big = inline_files(ws, max_bytes=10)
+        _check("names.bytes_total_is_exact", f"{n + 3} text file(s) larger than" in big,
+               f"every oversized file is counted: {big[:120]!r}", failures, verbose)
+        _check("names.bytes_list_is_bounded", _listed(big, ".cs") == CAP,
+               f"the enumeration is cut: {_listed(big, '.cs')} names", failures, verbose)
+        _check("names.bytes_elision_counted", f"(+ {n + 3 - CAP} more" in big,
+               f"the cut is announced with its count: {big[-200:]!r}", failures, verbose)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+    # The tree's outside-writes list. Capped for the judge, WHOLE for the report — the report
+    # has no prompt to protect and a dropped outside-write there is a lost safety signal.
+    empty = tempfile.mkdtemp(prefix="ase-names-tree-")
+    try:
+        outside = tempfile.mkdtemp(prefix="ase-names-out-")
+        paths = []
+        for i in range(CAP + 5):
+            ap = os.path.join(outside, f"O{i:03d}.txt")
+            with open(ap, "w") as fh:
+                fh.write("x")
+            paths.append(ap)
+        try:
+            judged = file_tree(empty, paths, max_files=60)
+            _check("names.tree_list_is_bounded", _listed(judged, ".txt") == CAP,
+                   f"the judge's tree lists at most the cap: {_listed(judged, '.txt')}",
+                   failures, verbose)
+            _check("names.tree_elision_counted", "(+ 5 more" in judged,
+                   f"...and says how many it left out: {judged[-200:]!r}", failures, verbose)
+            _check("names.tree_last_name_omitted",
+                   f"O{CAP + 4:03d}.txt" not in judged,
+                   "a path past the cap is really absent", failures, verbose)
+            report = file_tree(empty, paths)          # max_files=None — the report
+            _check("names.tree_report_lists_all",
+                   _listed(report, ".txt") == CAP + 5 and f"O{CAP + 4:03d}.txt" in report,
+                   f"the uncapped report still lists every outside write: "
+                   f"{_listed(report, '.txt')}", failures, verbose)
+            _check("names.tree_report_has_no_elision", "names omitted" not in report,
+                   "...with no elision line to explain", failures, verbose)
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+
 def _check_model_error_heuristic(failures, verbose):
     """_looks_like_model_error must not re-label unrelated failures: the old any-of
     ("model", "not found", ...) check fired whenever stderr merely mentioned the model name
@@ -9323,6 +9418,7 @@ def _run_selftest_checks(verbose: bool = False) -> int:
     _section(_check_inline_truncation, failures, verbose)
     _section(_check_inline_text_kinds, failures, verbose)
     _section(_check_inline_file_cap_announced, failures, verbose)
+    _section(_check_view_name_lists_bounded, failures, verbose)
 
     # model-rejection annotation only fires on actual rejections
     _section(_check_model_error_heuristic, failures, verbose)

@@ -289,10 +289,10 @@ not be pasted as written (review, fifth round).
 ```sh
 make -C harness dev             # once — creates .venv with the PINNED ruff AND shellcheck
 
-harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 581 here
+harness/.venv/bin/python -m agentskill_evals.cli selftest     # prints "— N arms"; 605 here
 harness/.venv/bin/python -m compileall -q harness/agentskill_evals/
 make -C harness lint                                          # ruff + shellcheck + a parse under every shell
-python3 -u harness/tools/mutate_mcp.py --jobs 8               # 354/354 production + 3/3 instrument + 257/257 fixture
+python3 -u harness/tools/mutate_mcp.py --jobs 8               # 358/358 production + 3/3 instrument + 257/257 fixture
 harness/.venv/bin/python harness/tools/verify_mcp_fixtures.py # fixtures + C3-2/C3-3/C3-4 + Phase 2 slice 1 probes; 832 checks
 harness/.venv/bin/python harness/tools/verify_mcp_proxy.py    # the C3 proxy over real pipes; prints "— N checks"; 91 here
 harness/.venv/bin/python harness/tools/verify_restricted_env.py # restricted_env.sh's FAILURE paths; 139 here, over the 5 shells on this machine

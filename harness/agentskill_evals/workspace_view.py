@@ -27,6 +27,13 @@ JUDGE_MAX_INLINE_BYTES = 4000
 # truncation note) — a run that legitimately produces a multi-MB CSV/JSON export must not
 # balloon report.md; the full file is still in workspace/.
 REPORT_MAX_INLINE_BYTES = 200_000
+# Cap on the FILENAME lists in the compact view's notes: the files a budget withheld, and
+# the files written outside the workspace. Those names exist so the judge knows evidence is
+# missing — but a workspace holding thousands of text files would spend more prompt budget
+# naming files it is told it cannot see than the budgets above saved by not inlining them,
+# which is the very cost those budgets exist to bound. Only the ENUMERATION is cut; the
+# total stays exact in the note that introduces it.
+JUDGE_MAX_NAMED_FILES = 25
 
 # Source/config extensions whose CONTENTS get inlined. An extension missing here is
 # treated as binary and silently reduced to a filename in the tree — which, for the
@@ -219,11 +226,30 @@ def leaked_skill_reads(
     return hits
 
 
+def _named_lines(names: list[str], limit: int | None) -> str:
+    """`names` as indented lines, at most `limit` of them, followed by a line saying how many
+    were left out. `limit=None` lists every name (the report, which has no prompt to protect).
+
+    The elision line is DERIVED from the same list the caller counts in its header, so the two
+    can never disagree about how many files there are: the header keeps the exact total even
+    when the enumeration under it is cut."""
+    shown = names if limit is None else names[:limit]
+    lines = [f"  {n}" for n in shown]
+    hidden = len(names) - len(shown)
+    if hidden:
+        lines.append(f"  ... (+ {hidden} more, names omitted to bound this view — "
+                     "withheld here, NOT missing from the run)")
+    return "\n".join(lines)
+
+
 def file_tree(workdir: str, extra: list[str] = (), max_files: int | None = None,
               seeded: Iterable[str] = ()) -> str:
     """A flat listing of every file under `workdir` (skill dirs / noise excluded), plus any
     `extra` paths written outside it. `max_files=None` lists everything (the report); the judge
-    passes a cap. Paths in `seeded` (workspace-relative) are annotated as pre-seeded inputs."""
+    passes a cap, which bounds the `extra` list too — it grows with whatever the run happened
+    to touch, and the report is the view with no prompt to protect, so it is the one that must
+    show every outside write. Paths in `seeded` (workspace-relative) are annotated as
+    pre-seeded inputs."""
     seeded_set = set(seeded or ())
     lines: list[str] = []
     count = 0
@@ -237,8 +263,13 @@ def file_tree(workdir: str, extra: list[str] = (), max_files: int | None = None,
         count += 1
     if truncated:
         lines.append(f"  ... (+ more, truncated at {max_files})")
-    for ap in extra:
-        lines.append(f"  {ap}   [written OUTSIDE the workspace by this run]")
+    if extra:
+        # Capped for the same reason the walk above is: this list is bounded only by
+        # how many distinct paths the run happened to touch. The count survives the
+        # cut, so an unlisted outside-write is still one the reader is told about.
+        lines.append(_named_lines(
+            [f"{ap}   [written OUTSIDE the workspace by this run]" for ap in extra],
+            None if max_files is None else JUDGE_MAX_NAMED_FILES))
     return "\n".join(lines) if lines else "  (workspace empty)"
 
 
@@ -251,10 +282,12 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
     cap with a truncation note. Paths in `seeded` are labelled as pre-seeded inputs. Non-text
     files are skipped (they appear in `file_tree`).
 
-    Every text file NOT inlined because a budget ran out is counted and named in a trailing
-    note. Silence there is a correctness bug, not a cosmetic one: the judge grades with tools
-    disabled, so a file dropped without a word is indistinguishable to it from a file the run
-    never produced — and it fails the rubric item for a file that is sitting in workspace/."""
+    Every text file NOT inlined because a budget ran out is COUNTED in a trailing note, and
+    named there up to JUDGE_MAX_NAMED_FILES. Silence there is a correctness bug, not a
+    cosmetic one: the judge grades with tools disabled, so a file dropped without a word is
+    indistinguishable to it from a file the run never produced — and it fails the rubric item
+    for a file that is sitting in workspace/. The count is what carries that, so it stays
+    exact however many names the cap withholds."""
     seeded_set = set(seeded or ())
     chunks: list[str] = []
     used = 0
@@ -301,16 +334,19 @@ def inline_files(workdir: str, extra: list[str] = (), max_files: int | None = No
         chunks.append(f"--- {label} ---\n{body}")
         used += 1
 
+    # Both notes exist only because a budget was exceeded, so a budget is in force by
+    # construction and their name lists are always capped — unlike the tree's, which
+    # is primary content when the report asks for all of it.
     if over_cap:
         chunks.append(f"--- NOT INLINED: {len(over_cap)} more text file(s), over the "
                       f"{max_files}-file budget ---\n"
-                      + "\n".join(f"  {n}" for n in over_cap)
+                      + _named_lines(over_cap, JUDGE_MAX_NAMED_FILES)
                       + "\nTheir contents are absent from this view — do not read that as "
                         "the files being absent or empty.")
     if over_bytes:
         chunks.append(f"--- NOT INLINED: {len(over_bytes)} text file(s) larger than "
                       f"{max_bytes} bytes ---\n"
-                      + "\n".join(f"  {n}" for n in over_bytes)
+                      + _named_lines(over_bytes, JUDGE_MAX_NAMED_FILES)
                       + "\nTheir contents are absent from this view — do not read that as "
                         "the files being absent or empty.")
     return "\n\n".join(chunks)

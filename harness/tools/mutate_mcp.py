@@ -2854,6 +2854,33 @@ MUTATIONS = [
      '        body = raw.decode("utf-8", errors="ignore")',
      "inline.byte_cap_split_codepoint"),
 
+    # ---- the compact view's NAME lists ----------------------------------------------------
+    # The names of withheld files are unbounded content inside the view whose whole purpose is
+    # a bounded prompt: a workspace of thousands of text files named every one of them, past
+    # the point where inlining them would have been cheaper.
+    ("M362-the-withheld-name-list-is-unbounded", WSVIEW,
+     "    shown = names if limit is None else names[:limit]",
+     "    shown = names",
+     "names.cap_list_is_bounded"),
+    # A silent cut is worse than the explosion: a truncated list of names reads exactly like
+    # the whole of it, so the reader under-counts what is missing instead of over-spending.
+    ("M363-the-cut-name-list-does-not-say-it-was-cut", WSVIEW,
+     "    if hidden:\n        lines.append(",
+     "    if False:\n        lines.append(",
+     "names.cap_elision_counted"),
+    # The count is the fact the note exists to carry — a judge that knows evidence is withheld
+    # does not mark the file absent. Capping the count as well as the names loses it.
+    ("M364-the-header-counts-only-the-names-it-printed", WSVIEW,
+     'f"--- NOT INLINED: {len(over_cap)} more text file(s), over the "',
+     'f"--- NOT INLINED: {len(over_cap[:JUDGE_MAX_NAMED_FILES])} more text file(s), over the "',
+     "names.cap_total_is_exact"),
+    # ...and the dual: the report has no prompt to protect, and an outside-write dropped from
+    # it is a lost safety signal, not a saved token.
+    ("M365-the-report-truncates-the-outside-writes-too", WSVIEW,
+     "            None if max_files is None else JUDGE_MAX_NAMED_FILES))",
+     "            JUDGE_MAX_NAMED_FILES))",
+     "names.tree_report_lists_all"),
+
     # ---- the MUST the Origin argument already covered, and the witness of the call ---------
     ("F22-the-protocol-version-header-is-never-validated", HTTPFIX,
      "        if path == PATH_STREAMABLE and not self._version_ok():\n            return 400",
