@@ -25,6 +25,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -117,15 +118,284 @@ class CellResult:
         return f"{base}@{self.reasoning_effort}" if self.reasoning_effort else base
 
 
+# THE per-cell redaction registry, held per THREAD rather than per Runner.
+#
+# `_secrets` is cell-scoped state — set at the top of _run_cell_body, cleared in _run_cell's
+# finally — that used to live on the Runner instance. One instance runs every cell, so under
+# `--jobs > 1` two cells write and clear the same attribute: cell B's `self._secrets = ()`
+# lands between cell A setting its token and cell A writing its transcript, and A's artifacts
+# are written UNREDACTED. Silent, nondeterministic, and it archives a live credential — so it
+# is fixed here rather than left for the parallelism gate to keep covering.
+#
+# Module-level rather than per-instance because it is read through a property that must also
+# answer on a Runner built WITHOUT __init__ (selftest constructs partial runners to exercise
+# the artifact writers in isolation, and a writer that raises AttributeError on "no secrets to
+# redact" would be failing at the safest possible moment). Sharing across Runner instances is
+# not a hazard: a cell sets this at its start and clears it in a finally, both on its own
+# thread, and no cell runs inside another.
+_CELL_SECRETS = threading.local()
+
+
+def parallel_unsafe_reason(agent: str, adapter, isolated: bool,
+                           specs: list[EvalSpec]) -> str | None:
+    """Why `--jobs > 1` cannot be honored for this run, or None if it can.
+
+    The original guard refused NON-isolated parallel runs only, on the premise that an
+    isolated cell's private home made concurrency safe. That premise was wrong, and review
+    caught it: an isolated home is a symlink OVERLAY, not a copy. `isolation._overlay`
+    wholesale-symlinks every entry it is not explicitly told to mask, so two isolated
+    cells' `.codex/config.toml` are two paths to one real file — verified by writing
+    through one overlay and reading the change back through another, with the write also
+    landing in the user's real home. Only `isolation_config_masks` entries are
+    materialized, and no adapter masks its whole config home.
+
+    The fix for that was to refuse `--jobs > 1` outright unless the adapter declares
+    `parallel_safe_config`, which no adapter does. That is correct but broader than the
+    hazard: what actually matters is whether the adapter's mutable configuration is
+    materialized PER CELL, and CONTAINED mode does exactly that. `build_isolated_home`
+    with `contained_subpaths` runs the copy pass instead of the wholesale symlink pass and
+    creates no symlink resolving out of the tree, so each cell's HOME is a private
+    directory and every file the CLI writes into it — config, startup bookkeeping,
+    whatever — is that cell's own. There is no shared path left for cell A to corrupt for
+    cell B, which is the same property `parallel_safe_config` names, arrived at per run
+    rather than declared per adapter.
+
+    So this reproduces `_run_cell_body`'s own containment decision
+    (`contain_home = has_credentials and contained_subs is not None`, taking effect only
+    under isolation) and requires it to hold for EVERY cell. Conservative in two
+    directions on purpose:
+
+      * Only the credential-env-var half of `has_credentials` is accepted. A spec whose
+        credentials arrive by MCP `${VAR}` interpolation would also be contained, but that
+        is resolved mid-cell from state this cannot see, so it is treated as unsafe.
+      * The check reads the same merged `os.environ` + `spec.env` each cell will read, so
+        a spec that blanks the variable is caught rather than assumed.
+
+    Refused rather than warned, as before: the failure mode is a wrong ANSWER, not a
+    crash — cell A's agent writes config cell B reads mid-launch, and the nondeterminism
+    gets attributed to the model.
+    """
+    if getattr(adapter, "parallel_safe_config", False):
+        return None
+    if not isolated:
+        return ("isolation is off (--no-isolated), so every cell runs against your real "
+                "HOME and shares one CLI configuration")
+    contained_subs = getattr(adapter, "contained_home_subpaths", None)
+    if contained_subs is None:
+        return (f"the {agent} adapter does not support a contained HOME, so an "
+                "isolated cell's home is a symlink overlay and every config file it does "
+                "not explicitly mask is a symlink to the one real file")
+    cred_names = getattr(adapter, "credential_env_vars", None) or []
+    if not cred_names:
+        return (f"the {agent} adapter declares no credential environment variable, "
+                "so nothing can switch its cells to a contained HOME")
+    uncontained = [
+        spec.name for spec in specs
+        if (spec.agents is None or agent in spec.agents)
+        and not any({**os.environ, **(spec.env or {})}.get(n) for n in cred_names)
+    ]
+    if uncontained:
+        shown = ", ".join(sorted(uncontained)[:3])
+        more = f" (+{len(uncontained) - 3} more)" if len(uncontained) > 3 else ""
+        return (f"no credential is set for {len(uncontained)} cell(s) — {shown}{more} — so "
+                f"they would run against a symlink-overlay HOME shared with every other "
+                f"cell. Export one of: {', '.join(cred_names)}")
+    return None
+
+
+def consistency_verdict(versions, versions_unknown, servers, servers_unknown,
+                        health, health_unknown, isolation) -> dict:
+    """The comparability verdict, derived from ALREADY-SPREAD axis values.
+
+    Split out of `Runner._consistency` so that reading the axes off a finished matrix and
+    JUDGING them are separate steps, and so the judgement has exactly one implementation.
+    `merge_consistency` needs the second half without the first: it starts from consistency
+    blocks that other runs already published, whose spreads were computed with an adapter in
+    hand — including the `mcp_servers_seen(argv)` fallback for cells that carry no witness,
+    which nothing reading a finished summary.json can reproduce, since argv is not in it.
+
+    Every argument is a `_spread` result: `versions`/`servers`/`health` are the DISTINCT
+    known values on their axis and the `*_unknown` counts are the cells that stated nothing.
+    `isolation` is the sorted set of achieved isolation booleans.
+    """
+    drift = []
+    if len(versions) > 1:
+        drift.append(f"CLI version varied across cells: {', '.join(versions)}")
+    if len(servers) > 1:
+        drift.append("MCP server set varied across cells: "
+                     + "; ".join("[" + (", ".join(str(n) for n in s) if s else "none")
+                                 + "]" for s in servers))
+    # WITHIN ONE SERVER SET, and only there. Health values carry the names they belong to
+    # — they must, or `echo failed, other connected` and `echo connected, other failed`
+    # would compare equal — so a difference in the SET propagates into this axis as well:
+    # `echo(connected)` beside `other(connected)` differed in identity alone, yet was
+    # reported as health drift too, contradicting the "cells that agree on which servers"
+    # framing below and double-counting one finding as two (found in review). When the
+    # set itself varied, that line already says so and this one has no common subject.
+    if len(servers) == 1 and len(health) > 1:
+        # Reported separately from the set, because it is a separate finding: cells that
+        # agree on WHICH servers and differ on whether they worked are not a matrix with
+        # a configuration difference, they are a matrix where one cell had no tool
+        # surface. Folded into the set line it read as "varied: [echo]; [echo]", which
+        # looks like a bug in the report rather than the finding it is.
+        drift.append("MCP server health varied across cells: "
+                     + "; ".join("[" + (", ".join(f"{n}({st})" for n, st in h)
+                                        if h else "none") + "]"
+                                 for h in health))
+    if len(isolation) > 1:
+        drift.append("isolation varied across cells: some ran isolated, some did not")
+
+    # Per-axis verification. "Exactly one known value AND no unknown cells" is the
+    # only shape that means the axis was actually compared; `len(...) <= 1` would
+    # accept an axis where every cell was unreadable, which is the mistake below.
+    cli_verified = len(versions) == 1 and versions_unknown == 0
+    # TWO verdicts, published separately, combined ONLY for `comparability` below.
+    # `mcp_server_set_verified` predates the health axis and is read by consumers as a
+    # statement about the SET; folding health into it made a matrix report
+    # `mcp_server_set_unknown_cells: 0` and `mcp_server_sets: [["echo"]]` beside
+    # `mcp_server_set_verified: false`, which reads as the set being in doubt when what
+    # was missing is whether those servers worked (found in review). A field changes
+    # meaning under a reader exactly once, silently, and then every consumer of it is
+    # wrong.
+    mcp_set_verified = len(servers) == 1 and servers_unknown == 0
+    # Health is a claim ABOUT a server set, so it is only verifiable within a uniform
+    # one — the same reason the drift line above is gated. Two cells that each ran a
+    # different single server and each reported it healthy have not agreed on this axis;
+    # they have no common subject to agree about, and `true` there would be a green
+    # field standing in for a comparison that had no ground to run on. An unstated
+    # status is unknown here exactly as an unreadable version is unknown on that axis —
+    # see the two-axis note above for why `()` (disabled servers, no health to state) is
+    # not the same as None.
+    mcp_health_verified = (mcp_set_verified
+                           and len(health) == 1 and health_unknown == 0)
+    # Redundant as written, and deliberately so: `comparability` requires BOTH axes, and
+    # saying that here does not depend on health's own gate above staying where it is.
+    mcp_verified = mcp_set_verified and mcp_health_verified
+    isolation_verified = len(isolation) == 1  # always readable; empty matrix aside
+    # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
+    # DIFFERED — including when nothing could be compared at all, which is every codex
+    # and antigravity matrix. Automation would then take a green field as proof of a
+    # check that never ran, which is precisely the failure this whole line of work
+    # keeps finding. The nuance cannot live only in a secondary field that careful
+    # readers consult; the primary one has to carry it.
+    #
+    # And it has to carry it for EVERY axis, not just the one that motivated the state.
+    # A first cut gated `verified` on cli_verified alone, so a claude matrix with a
+    # known uniform version and an entirely unread MCP axis reported "verified" beside
+    # `mcp_server_set_unknown_cells: 2` — reconstructing, one field over, exactly the
+    # misleading green this tri-state exists to remove (found in review).
+    if drift:
+        comparability = "drift"
+    elif cli_verified and mcp_verified and isolation_verified:
+        comparability = "verified"
+    else:
+        comparability = "unverified"
+
+    return {
+        # "verified"  — every axis was positively read on every cell, and agreed
+        # "unverified" — nothing differed, but at least one axis could not be read, so
+        #                sameness was never established (codex, antigravity)
+        # "drift"     — cells demonstrably ran under different conditions
+        "comparability": comparability,
+        "drift": drift,
+        "cli_versions": versions,
+        "cli_version_unknown_cells": versions_unknown,
+        "cli_version_verified": cli_verified,
+        # JSON arrays, one per distinct set — never a joined string, since a server
+        # name can contain any separator (see _spread's caller). Names only, so the
+        # field keeps the shape it has always had; the statuses the comparison actually
+        # runs on are in `mcp_server_states` below rather than changing this one
+        # underneath a reader.
+        "mcp_server_sets": [list(s) for s in servers],
+        "mcp_server_set_unknown_cells": servers_unknown,
+        # The HEALTH axis, reported BESIDE the set rather than folded into it. `[]` is a
+        # cell with nothing to state — argv named servers it disabled, which never ran —
+        # while a cell whose witness left any status unstated contributes no value here
+        # and is counted in `mcp_server_health_unknown_cells` instead. A matrix can be
+        # unverified on a name-identical set for that reason alone, and a reader looking
+        # only at `mcp_server_sets` would see two identical arrays and no explanation.
+        "mcp_server_states": [[[n, st] for n, st in h] for h in health],
+        "mcp_server_health_unknown_cells": health_unknown,
+        # SET ONLY — the meaning this field has always had. True when every cell's server
+        # set was readable and they agreed, whatever is or is not known about health.
+        "mcp_server_set_verified": mcp_set_verified,
+        # ...and health as its own verdict beside it, rather than quietly narrowing the
+        # one above. False whenever the set is not uniform: there is then no common set
+        # for a health claim to be about.
+        "mcp_server_health_verified": mcp_health_verified,
+        "isolation_uniform": len(isolation) <= 1,
+    }
+
+
+def merge_consistency(blocks: list[dict]) -> dict:
+    """One comparability verdict over several runs' worth of cells.
+
+    A fan-out runs the same sweep as N harness processes, and each writes its own
+    consistency block over its own cells. Those blocks answer "were MY cells comparable";
+    the merged run has to answer "were ALL of them", and that is not the conjunction of the
+    answers — two shards can each be internally uniform and still disagree WITH EACH OTHER
+    about the CLI version, which is exactly the drift the axis exists to catch, and exactly
+    what a fan-out makes more likely by starting N CLIs at once.
+
+    So the axes are re-spread across the blocks and re-judged, rather than the verdicts being
+    combined. Union the distinct values, sum the unknown counts, and hand the result to the
+    same `consistency_verdict` a single run uses.
+
+    Reading the published spreads rather than the cells is what makes this faithful: a
+    block's `mcp_server_sets` was computed with the adapter available, so a shard whose
+    cells had no witness contributed what `mcp_servers_seen(argv)` said. Rebuilding the
+    axes from summary.json's per-cell fields instead would silently drop that fallback and
+    reach a DIFFERENT verdict than the same cells got in a serial run.
+    """
+    def _union(key):
+        """Distinct values across the blocks, deduped and ordered by repr — the same key
+        `_spread` uses, and for the same reason: an axis value can be a list, which is
+        neither hashable nor totally ordered, and raising here would turn a comparability
+        note into a crashed merge."""
+        by_key: dict = {}
+        for block in blocks:
+            for value in block.get(key) or []:
+                by_key.setdefault(repr(value), value)
+        return [by_key[k] for k in sorted(by_key)]
+
+    def _sum(key):
+        return sum(int(block.get(key) or 0) for block in blocks)
+
+    # Health values arrive from JSON as [[name, status], ...] and are compared by repr, so
+    # they have to be tuples of tuples again or a merged block would never match a freshly
+    # computed one. Names and statuses both, since `_server_pair` produced str|None pairs.
+    health = [tuple((n, st) for n, st in entry) for entry in _union("mcp_server_states")]
+
+    # `isolation_uniform` is a boolean per block, not a spread, so the merged axis is the
+    # one place this cannot union values: two blocks that were each uniform may have been
+    # uniform at DIFFERENT values, and nothing published says which. Treated as uniform only
+    # when every block was — the honest reading of what the blocks actually assert.
+    isolation = [True] if all(b.get("isolation_uniform", True) for b in blocks) else [True, False]
+
+    return consistency_verdict(_union("cli_versions"), _sum("cli_version_unknown_cells"),
+                               [tuple(s) for s in _union("mcp_server_sets")],
+                               _sum("mcp_server_set_unknown_cells"),
+                               health, _sum("mcp_server_health_unknown_cells"),
+                               isolation)
+
+
 class Runner:
-    # Class-level default so the redacting artifact writers work on a Runner built without
-    # __init__ — selftest constructs partial runners to exercise the writers in isolation,
-    # and an artifact writer that raises AttributeError on "no secrets to redact" would be
-    # failing at the safest possible moment.
-    _secrets: tuple[str, ...] = ()
+    # Cleared per cell; see _CELL_SECRETS above for why this is per-thread and not per-instance.
+    @property
+    def _secrets(self) -> tuple[str, ...]:
+        return getattr(_CELL_SECRETS, "values", ())
+
+    @_secrets.setter
+    def _secrets(self, values: tuple[str, ...]) -> None:
+        _CELL_SECRETS.values = tuple(values)
+
     # Union of every cell's secrets, for the artifacts written AFTER the per-cell registry
-    # is cleared. See `_run_secrets` in __init__.
+    # is cleared. See `_run_secrets` in __init__. Run-scoped, so it stays on the instance —
+    # but it is accumulated by read-modify-write from every cell, which is a lost update
+    # under --jobs>1 and a lost update here means a credential MISSING from the summary's
+    # scrub set. `_run_secrets_lock` makes each union atomic.
     _run_secrets: tuple[str, ...] = ()
+    _run_secrets_lock = threading.Lock()
 
     def __init__(
         self,
@@ -176,7 +446,7 @@ class Runner:
         # runner writes. Cell-scoped (set in _run_cell_body, cleared in _run_cell's finally)
         # rather than run-scoped, and never stored on CellResult/RunResult — those are
         # serialized, which would archive the very strings this exists to keep out.
-        self._secrets: tuple[str, ...] = ()
+        self._secrets = ()
         # The run-scoped union of the above. Needed because the run summary is written long
         # after the last cell cleared `_secrets`, and it AGGREGATES cells — `RunResult.error`
         # carries a tail of the child's stdout/stderr, so summary.json and summary.md can
@@ -193,42 +463,37 @@ class Runner:
         """Deprecated pre-#67 view of the target columns: model ids only (effort dropped)."""
         return [t.model for t in self.targets]
 
+    def _add_run_secrets(self, values: tuple[str, ...]) -> None:
+        """Union `values` into the run-scoped scrub set atomically.
+
+        The bare `self._run_secrets = tuple(... self._run_secrets + values)` this replaces is a
+        read-modify-write, so two cells finishing together drop one of the two contributions —
+        and what is dropped is a credential the summary then republishes in the clear. Under
+        `--jobs 1` the lock is uncontended and costs nothing.
+        """
+        with self._run_secrets_lock:
+            self._run_secrets = tuple(dict.fromkeys(self._run_secrets + tuple(values)))
+
+    def _parallel_unsafe_reason(self, specs: list[EvalSpec]) -> str | None:
+        """See `parallel_unsafe_reason` — this is the bound form the runner and its CLI
+        preflight both refuse on."""
+        return parallel_unsafe_reason(self.agent, self.adapter, self.isolated, specs)
+
     # --- public -------------------------------------------------------------
 
     def run(self, specs: list[EvalSpec]) -> list[CellResult]:
         os.makedirs(self.run_dir, exist_ok=True)
-        if self.jobs > 1 and not getattr(self.adapter, "parallel_safe_config", False):
-            # An earlier revision of this guard refused only NON-isolated parallel runs, on
-            # the premise that an isolated cell's private home made concurrency safe. That
-            # premise was wrong, and review caught it: an isolated home is a symlink
-            # OVERLAY, not a copy. `isolation._overlay` wholesale-symlinks every entry it
-            # is not explicitly told to mask, so two isolated cells' `.codex/config.toml`
-            # are two paths to one real file — verified by writing through one overlay and
-            # reading the change back through another, with the write also landing in the
-            # user's real home. Only `isolation_config_masks` entries are materialized, and
-            # no adapter masks its whole config home.
-            #
-            # So isolation is the wrong thing to gate on. What matters is whether the
-            # adapter's mutable configuration is materialized PER CELL, which is what
-            # `parallel_safe_config` declares. Today no adapter can claim it, so this
-            # refuses `--jobs > 1` outright rather than pretending one flag combination is
-            # the dangerous one.
-            #
-            # Refused rather than warned because the failure mode is a wrong ANSWER, not a
-            # crash: cell A's agent (or the CLI's own startup bookkeeping) writes config
-            # that cell B reads mid-launch, and the resulting nondeterminism gets attributed
-            # to the model. `--jobs 1` is the whole workaround, and it is the default.
+        unsafe = self._parallel_unsafe_reason(specs) if self.jobs > 1 else None
+        if unsafe:
             raise RuntimeError(
-                f"refusing to run {self.jobs} cells in parallel: the {self.agent} adapter "
-                "does not materialize its CLI configuration per cell, so concurrent cells "
-                "share it. Isolation does NOT fix this — an isolated home is a symlink "
-                "overlay, so every config file it does not explicitly mask is a symlink to "
-                "the one real file, and a write through one cell's overlay is visible to "
-                "every other cell (and to your real home). Concurrent cells would corrupt "
-                "each other's results nondeterministically, in a way that looks like a "
-                "model problem. Use --jobs 1 (the default). Parallelism can be re-enabled "
-                "for a runner once its mutable config is materialized per cell — set "
-                "parallel_safe_config on the adapter then."
+                f"refusing to run {self.jobs} cells in parallel: {unsafe}. "
+                "Concurrent cells would corrupt each other's results nondeterministically, "
+                "in a way that looks like a model problem. Parallelism needs every cell's "
+                "mutable CLI configuration materialized per cell, which a CONTAINED HOME "
+                "provides — that is isolation on, an adapter that supports containment, and "
+                "a credential in the environment for every cell. Use --jobs 1 (the default) "
+                "otherwise, or set parallel_safe_config on an adapter that materializes its "
+                "config per cell by some other route."
             )
         if not self.isolated and self.adapter.mcp_off_depends_on_isolation:
             # This runner's MCP-off guarantee lives in the isolation overlay's config masks
@@ -425,7 +690,7 @@ class Runner:
                             if child_env.get(name)]
         env_secrets = tuple(dict.fromkeys(child_env[name] for name in cred_env_present))
         self._secrets = env_secrets
-        self._run_secrets = tuple(dict.fromkeys(self._run_secrets + env_secrets))
+        self._add_run_secrets(env_secrets)
 
         def _phase(phase: str):
             if p:
@@ -591,7 +856,7 @@ class Runner:
                 # cell that has both would stop redacting the token the moment it resolved a
                 # server credential.
                 self._secrets = tuple(dict.fromkeys(env_secrets + tuple(secrets)))
-                self._run_secrets = tuple(dict.fromkeys(self._run_secrets + self._secrets))
+                self._add_run_secrets(self._secrets)
                 mcp_scratch = tempfile.mkdtemp(prefix="ase-mcp-")
                 # Registered the moment it exists rather than once it holds something: the
                 # window between the two is where the credentials get written into it.
@@ -1065,113 +1330,9 @@ class Runner:
         health, health_unknown = _spread(health_raw)
         isolation = sorted({bool(c.isolated) for c in results})
 
-        drift = []
-        if len(versions) > 1:
-            drift.append(f"CLI version varied across cells: {', '.join(versions)}")
-        if len(servers) > 1:
-            drift.append("MCP server set varied across cells: "
-                         + "; ".join("[" + (", ".join(str(n) for n in s) if s else "none")
-                                     + "]" for s in servers))
-        # WITHIN ONE SERVER SET, and only there. Health values carry the names they belong to
-        # — they must, or `echo failed, other connected` and `echo connected, other failed`
-        # would compare equal — so a difference in the SET propagates into this axis as well:
-        # `echo(connected)` beside `other(connected)` differed in identity alone, yet was
-        # reported as health drift too, contradicting the "cells that agree on which servers"
-        # framing below and double-counting one finding as two (found in review). When the
-        # set itself varied, that line already says so and this one has no common subject.
-        if len(servers) == 1 and len(health) > 1:
-            # Reported separately from the set, because it is a separate finding: cells that
-            # agree on WHICH servers and differ on whether they worked are not a matrix with
-            # a configuration difference, they are a matrix where one cell had no tool
-            # surface. Folded into the set line it read as "varied: [echo]; [echo]", which
-            # looks like a bug in the report rather than the finding it is.
-            drift.append("MCP server health varied across cells: "
-                         + "; ".join("[" + (", ".join(f"{n}({st})" for n, st in h)
-                                            if h else "none") + "]"
-                                     for h in health))
-        if len(isolation) > 1:
-            drift.append("isolation varied across cells: some ran isolated, some did not")
-
-        # Per-axis verification. "Exactly one known value AND no unknown cells" is the
-        # only shape that means the axis was actually compared; `len(...) <= 1` would
-        # accept an axis where every cell was unreadable, which is the mistake below.
-        cli_verified = len(versions) == 1 and versions_unknown == 0
-        # TWO verdicts, published separately, combined ONLY for `comparability` below.
-        # `mcp_server_set_verified` predates the health axis and is read by consumers as a
-        # statement about the SET; folding health into it made a matrix report
-        # `mcp_server_set_unknown_cells: 0` and `mcp_server_sets: [["echo"]]` beside
-        # `mcp_server_set_verified: false`, which reads as the set being in doubt when what
-        # was missing is whether those servers worked (found in review). A field changes
-        # meaning under a reader exactly once, silently, and then every consumer of it is
-        # wrong.
-        mcp_set_verified = len(servers) == 1 and servers_unknown == 0
-        # Health is a claim ABOUT a server set, so it is only verifiable within a uniform
-        # one — the same reason the drift line above is gated. Two cells that each ran a
-        # different single server and each reported it healthy have not agreed on this axis;
-        # they have no common subject to agree about, and `true` there would be a green
-        # field standing in for a comparison that had no ground to run on. An unstated
-        # status is unknown here exactly as an unreadable version is unknown on that axis —
-        # see the two-axis note above for why `()` (disabled servers, no health to state) is
-        # not the same as None.
-        mcp_health_verified = (mcp_set_verified
-                               and len(health) == 1 and health_unknown == 0)
-        # Redundant as written, and deliberately so: `comparability` requires BOTH axes, and
-        # saying that here does not depend on health's own gate above staying where it is.
-        mcp_verified = mcp_set_verified and mcp_health_verified
-        isolation_verified = len(isolation) == 1  # always readable; empty matrix aside
-        # TRI-STATE, not a boolean. A boolean `consistent` reads true whenever nothing
-        # DIFFERED — including when nothing could be compared at all, which is every codex
-        # and antigravity matrix. Automation would then take a green field as proof of a
-        # check that never ran, which is precisely the failure this whole line of work
-        # keeps finding. The nuance cannot live only in a secondary field that careful
-        # readers consult; the primary one has to carry it.
-        #
-        # And it has to carry it for EVERY axis, not just the one that motivated the state.
-        # A first cut gated `verified` on cli_verified alone, so a claude matrix with a
-        # known uniform version and an entirely unread MCP axis reported "verified" beside
-        # `mcp_server_set_unknown_cells: 2` — reconstructing, one field over, exactly the
-        # misleading green this tri-state exists to remove (found in review).
-        if drift:
-            comparability = "drift"
-        elif cli_verified and mcp_verified and isolation_verified:
-            comparability = "verified"
-        else:
-            comparability = "unverified"
-
-        return {
-            # "verified"  — every axis was positively read on every cell, and agreed
-            # "unverified" — nothing differed, but at least one axis could not be read, so
-            #                sameness was never established (codex, antigravity)
-            # "drift"     — cells demonstrably ran under different conditions
-            "comparability": comparability,
-            "drift": drift,
-            "cli_versions": versions,
-            "cli_version_unknown_cells": versions_unknown,
-            "cli_version_verified": cli_verified,
-            # JSON arrays, one per distinct set — never a joined string, since a server
-            # name can contain any separator (see _spread's caller). Names only, so the
-            # field keeps the shape it has always had; the statuses the comparison actually
-            # runs on are in `mcp_server_states` below rather than changing this one
-            # underneath a reader.
-            "mcp_server_sets": [list(s) for s in servers],
-            "mcp_server_set_unknown_cells": servers_unknown,
-            # The HEALTH axis, reported BESIDE the set rather than folded into it. `[]` is a
-            # cell with nothing to state — argv named servers it disabled, which never ran —
-            # while a cell whose witness left any status unstated contributes no value here
-            # and is counted in `mcp_server_health_unknown_cells` instead. A matrix can be
-            # unverified on a name-identical set for that reason alone, and a reader looking
-            # only at `mcp_server_sets` would see two identical arrays and no explanation.
-            "mcp_server_states": [[[n, st] for n, st in h] for h in health],
-            "mcp_server_health_unknown_cells": health_unknown,
-            # SET ONLY — the meaning this field has always had. True when every cell's server
-            # set was readable and they agreed, whatever is or is not known about health.
-            "mcp_server_set_verified": mcp_set_verified,
-            # ...and health as its own verdict beside it, rather than quietly narrowing the
-            # one above. False whenever the set is not uniform: there is then no common set
-            # for a health claim to be about.
-            "mcp_server_health_verified": mcp_health_verified,
-            "isolation_uniform": len(isolation) <= 1,
-        }
+        return consistency_verdict(versions, versions_unknown, servers,
+                                   servers_unknown, health, health_unknown,
+                                   isolation)
 
     def _warn_inconsistent(self, consistency: dict) -> None:
         """Say it on stderr as well as in the artifact. A drift recorded only in
